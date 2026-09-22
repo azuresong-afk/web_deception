@@ -1,0 +1,23 @@
+# Запрет доверия заголовкам, которые клиент может подставить сам.
+#
+# CLAUDE.md: «Доверять X-Forwarded-For и подобным заголовкам, кроме пришедших
+# от явно заданных доверенных прокси, — запрещено». Угроза T1: атакующий
+# подставляет в X-Forwarded-For чужой IP, и мы блокируем легитимного
+# пользователя или партнёра вместо атакующего.
+#
+# На этапе 2 появится модуль доверенных прокси — единственное место, где
+# такие заголовки читать можно; он будет исключён из этого правила явно.
+
+rules:
+  - id: go-untrusted-forwarded-headers
+    languages: [go]
+    severity: ERROR
+    message: >-
+      Заголовок с адресом клиента читается напрямую. Его может подставить
+      любой клиент; доверять ему можно только от явно заданных доверенных
+      прокси, и только через модуль, который это проверяет. CLAUDE.md,
+      раздел «Запрещено»; угроза T1.
+    pattern-either:
+      - pattern: $R.Header.Get("=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/")
+      - pattern: $R.Header.Values("=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/")
+      - pattern: $R.Header["=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/"]

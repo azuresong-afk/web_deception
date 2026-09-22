@@ -1,0 +1,31 @@
+# Сравнение MAC, подписей и дайджестов за постоянное время — Python.
+# Причины те же, что в go-mac-compare-constant-time.yaml: атака по времени,
+# угроза T7, ADR-0006. Стандартная функция: hmac.compare_digest.
+
+rules:
+  - id: python-mac-compare-constant-time
+    languages: [python]
+    severity: ERROR
+    message: >-
+      MAC, подпись или дайджест сравниваются оператором == или !=, время
+      которого зависит от числа совпавших байт. Используйте hmac.compare_digest.
+      Угроза T7, ADR-0006.
+    pattern-either:
+      - pattern: $H.hexdigest() == $X
+      - pattern: $X == $H.hexdigest()
+      - pattern: $H.digest() == $X
+      - pattern: $X == $H.digest()
+      - patterns:
+          - pattern-either:
+              - pattern: $A == $B
+              - pattern: $A != $B
+          - metavariable-regex:
+              metavariable: $A
+              regex: (?i)^(?:[a-z_][a-z0-9_.]*)?(mac|signature|digest)[a-z0-9_]*$
+      - patterns:
+          - pattern-either:
+              - pattern: $A == $B
+              - pattern: $A != $B
+          - metavariable-regex:
+              metavariable: $B
+              regex: (?i)^(?:[a-z_][a-z0-9_.]*)?(mac|signature|digest)[a-z0-9_]*$

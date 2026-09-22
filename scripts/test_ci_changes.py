@@ -38,7 +38,14 @@ class ClassifyTest(unittest.TestCase):
         self.assertTrue(cc.classify(["tools/actionlint/go.mod"])["go"])
 
     def test_semgrep_rules_do_not_run_go(self) -> None:
+        # Правила Semgrep проверяет задание sast, которое запускается всегда.
         self.assertFalse(cc.classify(["tools/semgrep/README.md"])["go"])
+
+    def test_vulnerability_tool_update_runs_go(self) -> None:
+        self.assertTrue(cc.classify(["tools/govulncheck/go.sum"])["go"])
+
+    def test_scanner_image_update_runs_containers(self) -> None:
+        self.assertTrue(cc.classify(["tools/scanners/compose.yaml"])["containers"])
 
     def test_compose_change_runs_containers_only(self) -> None:
         result = cc.classify(["deploy/compose/compose.yaml"])

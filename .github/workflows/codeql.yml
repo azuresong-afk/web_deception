@@ -1,0 +1,92 @@
+# CodeQL — статический анализ безопасности от GitHub.
+#
+# В отличие от линтеров, CodeQL отслеживает поток данных через всю программу:
+# от места, где данные пришли извне (HTTP-запрос, переменная окружения),
+# до места, где они опасны (SQL-запрос, путь к файлу, команда shell, лог).
+# Для публичных репозиториев бесплатен — одна из причин ADR-0011.
+#
+# Отдельный workflow, а не задание в ci.yml: CodeQL нужно право записи
+# результатов в раздел Security, а остальному CI оно не нужно. Право выдаётся
+# только этому заданию.
+#
+# Результаты: вкладка Security → Code scanning и комментарии прямо в PR.
+# Важно: в настройках репозитория CodeQL «default setup» должен быть
+# выключен — он конфликтует с этим workflow (advanced setup).
+
+name: codeql
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # Раз в неделю: GitHub регулярно добавляет новые запросы CodeQL,
+  # и старый код может оказаться уязвимым по новым правилам.
+  schedule:
+    - cron: "37 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Запись результатов анализа в раздел Security. Больше ничего.
+      security-events: write
+    strategy:
+      # Упавший анализ одного языка не должен отменять остальные.
+      fail-fast: false
+      matrix:
+        include:
+          # Для Go CodeQL наблюдает за сборкой, поэтому собираем сами —
+          # ровно то, что попадает в продукт, без модулей инструментов.
+          - language: go
+            build-mode: manual
+          - language: python
+            build-mode: none
+          # Анализ самих workflow: инъекции, опасные события, лишние права.
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+          cache: false
+
+      - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Расширенный набор запросов безопасности: больше находок ценой
+          # чуть большего числа ложных срабатываний. Для продукта
+          # безопасности это правильный обмен.
+          queries: security-extended
+          # Примеры к тестам правил Semgrep содержат нарушения нарочно.
+          config: |
+            paths-ignore:
+              - tools/semgrep/rules
+
+      - if: matrix.language == 'go'
+        name: сборка сенсора
+        env:
+          GOTOOLCHAIN: local
+        run: make build
+
+      - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          category: "/language:${{ matrix.language }}"

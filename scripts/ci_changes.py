@@ -32,9 +32,17 @@ from collections.abc import Callable, Iterable
 # Какие каталоги относятся к какому заданию. Один файл может запускать
 # несколько заданий: исходники сенсора нужны и тестам Go, и сборке образа.
 GROUPS: dict[str, tuple[str, ...]] = {
-    "go": ("sensor/", "tools/golangci-lint/", "tools/actionlint/"),
+    "go": ("sensor/", "tools/golangci-lint/", "tools/actionlint/", "tools/govulncheck/"),
     "python": ("controlplane/", "scripts/"),
-    "containers": ("deploy/", "sensor/", "controlplane/", "scripts/", ".dockerignore"),
+    "containers": (
+        "deploy/",
+        "sensor/",
+        "controlplane/",
+        "scripts/",
+        ".dockerignore",
+        # Образы сканеров hadolint и Trivy.
+        "tools/scanners/",
+    ),
 }
 
 # Изменение этих файлов запускает всё: они определяют, что и как проверяется.

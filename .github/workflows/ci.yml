@@ -23,6 +23,16 @@ on:
     branches: [main]
   push:
     branches: [main]
+  # Раз в неделю — полный прогон main без всяких изменений в коде. Новые
+  # уязвимости публикуются каждый день: зависимость, чистая в понедельник,
+  # во вторник может оказаться уязвимой. Без этого прогона мы узнали бы
+  # об этом только при следующем PR. Минута выбрана не нулевой, чтобы
+  # не попадать в пик нагрузки раннеров GitHub в начале часа.
+  schedule:
+    - cron: "17 5 * * 1"
+  # Ручной запуск из вкладки Actions — например, сразу после публикации
+  # громкой уязвимости.
+  workflow_dispatch:
 
 # Права токена GITHUB_TOKEN по умолчанию для всех заданий: только чтение
 # кода. Ни одному заданию здесь не нужно ничего писать в репозиторий,
@@ -117,6 +127,9 @@ jobs:
       - name: сборка бинарника
         run: make build
 
+      - name: уязвимости в зависимостях и стандартной библиотеке (govulncheck)
+        run: make security-go
+
   python:
     name: control plane (Python)
     needs: changes
@@ -152,6 +165,9 @@ jobs:
       - name: тесты с порогом покрытия
         run: make test-py test-scripts
 
+      - name: уязвимости в зависимостях из uv.lock (pip-audit)
+        run: make security-py
+
   containers:
     name: образы и стек
     needs: changes
@@ -185,13 +201,57 @@ jobs:
       - name: собрать образы, поднять стек, проверить готовность
         run: make smoke
 
+      - name: линтер Dockerfile (hadolint)
+        run: make security-dockerfiles
+
+      # Образы уже собраны шагом smoke, пересобирать не нужно.
+      - name: уязвимости в образах (Trivy)
+        run: make security-images
+
+  # Поиск секретов не зависит от того, какие файлы изменены: секрет можно
+  # положить в любой файл, включая документацию.
+  secrets:
+    name: секреты в истории git
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Вся история: секрет, добавленный в одном коммите PR и удалённый
+          # в следующем, в итоговом состоянии файлов не виден — только в истории.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.27.x"
+          check-latest: true
+          cache-dependency-path: tools/*/go.sum
+
+      - name: gitleaks
+        run: make security-secrets
+
+  # Собственные правила Semgrep тоже запускаются всегда: правило про
+  # GitHub Actions касается workflow, правила про логирование — любого кода.
+  sast:
+    name: собственные правила Semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: тесты правил и проверка кода
+        run: make security-sast
+
   # Единственная проверка, которую нужно сделать обязательной в защите ветки
   # main (шаг 7). Задания выше могут быть пропущены, если их часть кода
   # не менялась, а пропущенное задание нельзя сделать обязательным: PR
   # с правкой документации ждал бы его вечно.
   ci-ok:
     name: ci-ok
-    needs: [changes, go, python, containers]
+    needs: [changes, go, python, containers, secrets, sast]
     # always(): запускаться даже если что-то упало — иначе при падении это
     # задание было бы пропущено, а пропуск засчитался бы как успех.
     if: always()
@@ -204,8 +264,11 @@ jobs:
           GO: ${{ needs.go.result }}
           PYTHON: ${{ needs.python.result }}
           CONTAINERS: ${{ needs.containers.result }}
+          SECRETS: ${{ needs.secrets.result }}
+          SAST: ${{ needs.sast.result }}
         run: |
           echo "changes=$CHANGES go=$GO python=$PYTHON containers=$CONTAINERS"
+          echo "secrets=$SECRETS sast=$SAST"
 
           # Задание changes обязано пройти. Если оно упало, все остальные
           # будут пропущены — и без этой строки пропуск выглядел бы
@@ -214,6 +277,15 @@ jobs:
             echo "::error::не удалось определить, какие проверки нужны"
             exit 1
           fi
+
+          # Поиск секретов и Semgrep запускаются всегда, поэтому для них
+          # пропуск — тоже провал: значит, что-то сломалось в самом workflow.
+          for result in "$SECRETS" "$SAST"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::обязательная проверка безопасности завершилась с результатом $result"
+              exit 1
+            fi
+          done
 
           # Остальные: успех или пропуск за ненадобностью. Всё прочее —
           # failure, cancelled — провал.

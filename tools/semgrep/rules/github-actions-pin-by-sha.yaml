@@ -1,0 +1,24 @@
+# Каждый action и переиспользуемый workflow закреплён полным SHA коммита.
+#
+# CLAUDE.md: «Использовать GitHub Actions по тегу — запрещено, только по полному
+# SHA коммита». Угроза T12. Тег вроде v4 автор action (или тот, кто украл его
+# учётную запись) может в любой момент переставить на другой код, и этот код
+# выполнится в нашем CI. SHA коммита переставить нельзя.
+#
+# actionlint этого не проверяет: для него "actions/checkout@v4" корректен.
+
+rules:
+  - id: github-actions-pin-by-sha
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      Action или workflow подключён не по полному SHA коммита. Замените ссылку
+      на 40-символьный SHA и оставьте версию в комментарии рядом:
+      uses: owner/repo@<sha> # v1.2.3. CLAUDE.md, раздел «Запрещено»; угроза T12.
+    patterns:
+      - pattern: "uses: $USES"
+      # Разрешено: локальный action (./...), SHA коммита из 40 символов,
+      # образ docker://, закреплённый по digest.
+      - metavariable-regex:
+          metavariable: $USES
+          regex: ^(?!\./)(?!.*@[0-9a-f]{40}$)(?!docker://.*@sha256:[0-9a-f]{64}$).*$

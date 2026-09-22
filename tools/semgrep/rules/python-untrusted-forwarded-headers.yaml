@@ -1,0 +1,15 @@
+# Запрет доверия заголовкам, которые клиент может подставить сам, — Python.
+# Причины те же, что в go-untrusted-forwarded-headers.yaml: CLAUDE.md и угроза T1.
+
+rules:
+  - id: python-untrusted-forwarded-headers
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Заголовок с адресом клиента читается напрямую. Его может подставить
+      любой клиент; доверять ему можно только от явно заданных доверенных
+      прокси. CLAUDE.md, раздел «Запрещено»; угроза T1.
+    pattern-either:
+      - pattern: $R.headers.get("=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/", ...)
+      - pattern: $R.headers["=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/"]
+      - pattern: $R.headers.getlist("=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/")

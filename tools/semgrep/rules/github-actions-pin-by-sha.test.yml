@@ -1,0 +1,24 @@
+# Тестовые примеры для правила github-actions-pin-by-sha.
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      # ruleid: github-actions-pin-by-sha
+      - uses: actions/checkout@v4
+      # ruleid: github-actions-pin-by-sha
+      - uses: actions/setup-go@main
+      # Короткий SHA тоже не годится: его можно подобрать коллизией.
+      # ruleid: github-actions-pin-by-sha
+      - uses: actions/setup-python@5fda3b9
+      # ruleid: github-actions-pin-by-sha
+      - uses: docker://alpine:3.20
+      # ok: github-actions-pin-by-sha
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # ok: github-actions-pin-by-sha
+      - uses: ./.github/actions/local
+      # ok: github-actions-pin-by-sha
+      - uses: docker://alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  reuse:
+    # ruleid: github-actions-pin-by-sha
+    uses: some-org/workflows/.github/workflows/build.yml@v1

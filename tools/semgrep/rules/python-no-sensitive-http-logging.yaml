@@ -1,0 +1,38 @@
+# Запрет логирования чувствительных данных HTTP в Python (FastAPI, Starlette).
+#
+# То же правило, что для Go, и по той же причине: CLAUDE.md, раздел
+# «Запрещено», и угроза T4. Режим taint отслеживает путь данных через
+# переменные, f-строки и именованные аргументы вроде extra={...}.
+
+rules:
+  - id: python-no-sensitive-http-logging
+    languages: [python]
+    severity: ERROR
+    mode: taint
+    message: >-
+      Чувствительные данные HTTP попадают в лог: заголовки целиком, учётные
+      данные, cookies, тело, параметры запроса или полный URL. Логируйте только
+      метаданные (метод, путь, код ответа, отдельные безопасные заголовки).
+      CLAUDE.md, раздел «Запрещено»; угроза T4.
+    pattern-sources:
+      - patterns:
+          - pattern: $R.headers
+          - pattern-not-inside: $R.headers.get(...)
+          - pattern-not-inside: $R.headers[...]
+      - pattern: $R.headers.get("=~/(?i)^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token)$/", ...)
+      - pattern: $R.headers["=~/(?i)^(authorization|proxy-authorization|cookie|set-cookie|x-api-key|x-auth-token)$/"]
+      - pattern: $R.cookies
+      - pattern: $R.query_params
+      - pattern: $R.body()
+      - pattern: $R.json()
+      - pattern: $R.form()
+      # Полный URL включает строку параметров, а путь отдельно — нет.
+      - patterns:
+          - pattern: $R.url
+          - pattern-not-inside: $R.url.path
+    pattern-sinks:
+      - patterns:
+          - pattern: $LOG.$METHOD(...)
+          - metavariable-regex:
+              metavariable: $METHOD
+              regex: ^(debug|info|warning|warn|error|exception|critical|log)$
