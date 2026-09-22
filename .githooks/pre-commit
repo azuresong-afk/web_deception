@@ -1,0 +1,79 @@
+#!/bin/sh
+# Хук pre-commit: быстрые проверки ДО того, как коммит создан.
+#
+# Включается один раз командой `make hooks`. Git не устанавливает хуки
+# из репозитория сам — и это правильно: иначе простое клонирование чужого
+# репозитория запускало бы чужой код на вашей машине.
+#
+# Что проверяется и как ведёт себя при сбое:
+#   1. Секреты в индексированных изменениях — gitleaks. Если проверить
+#      нельзя (нет Go), коммит БЛОКИРУЕТСЯ: утёкший секрет не отзывается
+#      удалением коммита, это необратимо.
+#   2. Форматирование индексированных файлов Go и Python. Если инструмента
+#      нет, проверка ПРОПУСКАЕТСЯ с предупреждением: ошибку форматирования
+#      поймает CI, и она исправляется одной командой.
+#
+# Хук — удобство, а не граница безопасности: его обходит `git commit
+# --no-verify`. Граница — CI и защита ветки main.
+
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# --- 1. Секреты -------------------------------------------------------------
+
+if ! command -v go >/dev/null 2>&1; then
+    echo "pre-commit: Go не найден — без него нельзя проверить коммит на секреты." >&2
+    echo "Установите Go 1.27. Обойти проверку: git commit --no-verify (на свой риск)." >&2
+    exit 1
+fi
+
+# --pre-commit --staged проверяет только то, что уйдёт в этот коммит.
+# --redact: найденный секрет не печатается в терминал целиком.
+if ! (cd tools/gitleaks && go tool gitleaks git --pre-commit --staged \
+        --config ../../.gitleaks.toml --redact --no-banner --log-level warn ../..); then
+    echo "" >&2
+    echo "pre-commit: в изменениях найден секрет, коммит отменён." >&2
+    echo "Уберите его из файла и из индекса (git restore --staged <файл>)." >&2
+    echo "Если секрет настоящий и уже был где-то отправлен — считайте его" >&2
+    echo "скомпрометированным и отзовите." >&2
+    exit 1
+fi
+
+# --- 2. Форматирование ------------------------------------------------------
+#
+# Проверяется содержимое ИНДЕКСА (git show ":файл"), а не файла на диске:
+# в коммит уходит именно индекс, и файл на диске мог быть поправлен после
+# `git add`.
+
+bad_go=$(git diff --cached --name-only --diff-filter=ACMR -- '*.go' | while IFS= read -r f; do
+    if [ -n "$(git show ":$f" | gofmt -l)" ]; then
+        printf '  %s\n' "$f"
+    fi
+done)
+
+bad_py=""
+if git diff --cached --name-only --diff-filter=ACMR -- '*.py' | grep -q .; then
+    if command -v uv >/dev/null 2>&1; then
+        bad_py=$(git diff --cached --name-only --diff-filter=ACMR -- '*.py' | while IFS= read -r f; do
+            if ! git show ":$f" | uv run --quiet --project controlplane ruff format \
+                    --config controlplane/pyproject.toml --check --stdin-filename "$f" - \
+                    >/dev/null 2>&1; then
+                printf '  %s\n' "$f"
+            fi
+        done)
+    else
+        echo "pre-commit: uv не найден — форматирование Python не проверено, это сделает CI." >&2
+    fi
+fi
+
+if [ -n "$bad_go$bad_py" ]; then
+    echo "pre-commit: файлы не отформатированы:" >&2
+    [ -n "$bad_go" ] && printf '%s\n' "$bad_go" >&2
+    [ -n "$bad_py" ] && printf '%s\n' "$bad_py" >&2
+    echo "Запустите make fmt, затем git add для исправленных файлов." >&2
+    exit 1
+fi
+
+exit 0

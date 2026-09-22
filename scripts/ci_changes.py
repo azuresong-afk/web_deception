@@ -32,7 +32,19 @@ from collections.abc import Callable, Iterable
 # Какие каталоги относятся к какому заданию. Один файл может запускать
 # несколько заданий: исходники сенсора нужны и тестам Go, и сборке образа.
 GROUPS: dict[str, tuple[str, ...]] = {
-    "go": ("sensor/", "tools/golangci-lint/", "tools/actionlint/", "tools/govulncheck/"),
+    "go": (
+        "sensor/",
+        "tools/golangci-lint/",
+        "tools/actionlint/",
+        "tools/govulncheck/",
+        # Интеграционный тест git-хуков запускается в задании Go: хукам
+        # нужен Go для gitleaks.
+        ".githooks/",
+        ".gitleaks.toml",
+        "tools/gitleaks/",
+        "scripts/hooks_test.py",
+        "scripts/check_commit_msg.py",
+    ),
     "python": ("controlplane/", "scripts/"),
     "containers": (
         "deploy/",

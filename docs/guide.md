@@ -8,7 +8,7 @@
 здесь расходится с кодом — это ошибка, и исправлять её нужно так же,
 как баг.
 
-**Состояние на:** этап 1, шаг 6 — проверки безопасности в CI.
+**Состояние на:** этап 1 завершён — каркас, локальный стек, конвейер проверок и процесс разработки.
 
 ---
 
@@ -245,14 +245,14 @@ Workflow `.github/workflows/ci.yml` запускается на каждый PR 
 красный результат в CI воспроизводится у вас той же командой.
 
 ```
-             ┌──────────────────────────┐        ┌─────────┐ ┌──────┐
-             │ changes                  │        │ secrets │ │ sast │  всегда
-             └──┬──────────┬─────────┬──┘        └────┬────┘ └──┬───┘
+             ┌──────────────────────────┐   ┌─────────┐ ┌──────┐ ┌─────────┐
+             │ changes                  │   │ secrets │ │ sast │ │ commits │  всегда
+             └──┬──────────┬─────────┬──┘   └────┬────┘ └──┬───┘ └────┬────┘
                 ▼          ▼         ▼                │         │
              ┌──────┐  ┌────────┐ ┌────────────┐      │         │
              │  go  │  │ python │ │ containers │      │         │  если их часть
              └──┬───┘  └───┬────┘ └─────┬──────┘      │         │  кода менялась
-                └──────────┴────────────┴─────────────┴─────────┘
+                └──────────┴────────────┴─────────────┴─────────┴──────┘
                                         ▼
                                   ┌───────────┐
                                   │   ci-ok   │   итог: обязательная проверка
@@ -264,11 +264,12 @@ Workflow `.github/workflows/ci.yml` запускается на каждый PR 
 
 | Задание | Когда запускается | Что делает | Локально |
 |---|---|---|---|
-| `go` | изменён `sensor/` или инструменты Go в `tools/` | golangci-lint, actionlint, тесты с детектором гонок, сборка, govulncheck | `make lint-go lint-workflows test-go build security-go` |
+| `go` | изменён `sensor/`, инструменты Go в `tools/` или git-хуки | golangci-lint, actionlint, тесты с детектором гонок, тест хуков, сборка, govulncheck | `make lint-go lint-workflows test-go test-hooks build security-go` |
 | `python` | изменён `controlplane/` или `scripts/` | ruff, mypy, тесты с порогом покрытия, pip-audit | `make lint-py test-py test-scripts security-py` |
 | `containers` | изменены образы, compose или код сервисов | политика контейнеров, сборка и запуск стека, hadolint, Trivy | `make lint-containers smoke security-dockerfiles security-images` |
 | `secrets` | всегда | gitleaks по всей истории | `make security-secrets` |
 | `sast` | всегда | тесты правил Semgrep и проверка кода по ним | `make security-sast` |
+| `commits` | каждый PR | формат сообщений всех коммитов PR | `python3 scripts/check_commit_msg.py --range` |
 | `ci-ok` | всегда | проверяет, что всё нужное прошло | — |
 | `codeql` | всегда, свой workflow | анализ потока данных для Go, Python и workflow | только в CI |
 
@@ -298,6 +299,8 @@ Workflow `.github/workflows/ci.yml` запускается на каждый PR 
 | `make lint` | golangci-lint для Go (включая gosec), ruff и mypy для Python, политику контейнеров, actionlint для workflow |
 | `make test` | тесты Go с детектором гонок, тесты Python, тесты скриптов, пороги покрытия |
 | `make smoke` | поднимает весь стек, проверяет готовность, останавливает |
+| `make hooks` | включает git-хуки в этом клоне — один раз |
+| `make test-hooks` | проверяет хуки настоящими коммитами во временном репозитории |
 | `make security` | секреты, уязвимости зависимостей Go и Python, правила Semgrep, Dockerfile, уязвимости образов; нужен Docker |
 
 Где что лежит:
@@ -315,6 +318,9 @@ tools/scanners/compose.yaml    сканеры в контейнерах: Semgrep
 tools/semgrep/rules/           собственные правила Semgrep и тесты к ним
 .gitleaks.toml, .semgrepignore что и как ищут gitleaks и Semgrep
 scripts/ci_changes.py          выбор заданий CI по изменённым файлам
+scripts/check_commit_msg.py    формат сообщений коммитов: для хука и для CI
+.githooks/                     git-хуки pre-commit и commit-msg
+.github/rulesets/main.json     правила защиты ветки main для импорта
 scripts/check_containers.py    политика контейнеров как код
 scripts/gen-secrets.sh         создание локальных секретов
 deploy/docker/                 Dockerfile'ы
@@ -356,6 +362,38 @@ deploy/compose/                docker compose и конфигурация NATS
 
 ---
 
+## Процесс разработки
+
+Как изменение попадает в `main`:
+
+```
+ ветка ──► коммит ──────────────► push ──► PR ──► CI ──► слияние
+            │                               │      │        │
+            ├ pre-commit: секреты,          │      │        └ только через PR:
+            │   формат изменённых файлов    │      │          ci-ok и CodeQL зелёные,
+            └ commit-msg: формат сообщения  │      │          ветка актуальна,
+                                            │      │          обсуждения закрыты
+                          описание по шаблону      └ всё из make lint, test, security
+                                                     + формат всех коммитов PR
+```
+
+**Хуки** включаются один раз на клон: `make hooks`. Они ловят ошибки
+за секунды, а не через минуты в CI, но обходятся `--no-verify` —
+поэтому это удобство, а не граница. Проверка секретов в хуке при
+отсутствии Go **блокирует** коммит: утёкший секрет не вернуть.
+
+**Правила ветки `main`** хранятся в `.github/rulesets/main.json` и
+применяются импортом в настройках репозитория. Что означает каждое
+правило — в [.github/rulesets/README.md](../.github/rulesets/README.md).
+Обязательных одобрений ноль: GitHub не даёт автору одобрить свой PR,
+а человек в проекте пока один.
+
+**Формат коммитов** — Conventional Commits, подробно в
+[CONTRIBUTING.md](../CONTRIBUTING.md). Из него позже будет собираться
+changelog и номер версии.
+
+---
+
 ## Карта документов
 
 | Документ | Отвечает на вопрос |
@@ -365,6 +403,8 @@ deploy/compose/                docker compose и конфигурация NATS
 | [docs/adr/](adr/) | почему принято именно такое решение и какие были альтернативы |
 | [docs/roadmap.md](roadmap.md) | где мы сейчас, что впереди, какой накоплен долг |
 | [docs/glossary.md](glossary.md) | что означает термин |
+| [CONTRIBUTING.md](../CONTRIBUTING.md) | как вносить изменения: хуки, формат коммитов, PR |
+| [CHANGELOG.md](../CHANGELOG.md) | что изменилось в продукте |
 | [CLAUDE.md](../CLAUDE.md) | правила разработки, обязательные для всех изменений |
 | [SECURITY.md](../SECURITY.md) | как сообщить об уязвимости |
 
@@ -382,13 +422,16 @@ deploy/compose/                docker compose и конфигурация NATS
    `type: ignore`, `nosemgrep`, `ignore`, `skip`, изменения порогов,
    удалённые правила, правки `.semgrepignore`, `.gitleaks.toml`,
    `.golangci.yml`. Каждое такое место обязано быть объяснено рядом, в коде.
-3. **Новые зависимости.** `pyproject.toml`, `go.mod`, Dockerfile. У каждой
+3. **Код, который запустится на вашей машине.** Изменения в `.githooks/`,
+   `Makefile`, `scripts/` исполняются у вас при следующем коммите или
+   `make`. Правки `.github/rulesets/` — это правила защиты ветки.
+4. **Новые зависимости.** `pyproject.toml`, `go.mod`, Dockerfile. У каждой
    должно быть написано, зачем она нужна и почему ей можно доверять.
-4. **Dockerfile, compose и workflow.** Новые порты, `user`, `cap_add`,
+5. **Dockerfile, compose и workflow.** Новые порты, `user`, `cap_add`,
    `privileged`, тома с каталогами хоста. В workflow — расширение
    `permissions`, событие `pull_request_target`, `${{ }}` внутри `run:`,
    action без SHA. `make lint` ловит многое, но не всё.
-5. **Логирование.** Любое новое `logger.` или `slog.` — что именно пишется?
+6. **Логирование.** Любое новое `logger.` или `slog.` — что именно пишется?
    Нет ли там тела запроса, заголовков, параметров, токенов?
-6. **Тесты.** Есть ли тест, который **падает** без нового кода? Тест,
+7. **Тесты.** Есть ли тест, который **падает** без нового кода? Тест,
    который проходит и с ошибкой, и без неё, ничего не доказывает.

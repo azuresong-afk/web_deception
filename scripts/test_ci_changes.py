@@ -44,6 +44,12 @@ class ClassifyTest(unittest.TestCase):
     def test_vulnerability_tool_update_runs_go(self) -> None:
         self.assertTrue(cc.classify(["tools/govulncheck/go.sum"])["go"])
 
+    def test_hook_changes_run_go(self) -> None:
+        # Хуки тестируются в задании Go: им нужен Go для gitleaks.
+        for path in (".githooks/pre-commit", ".gitleaks.toml", "scripts/check_commit_msg.py"):
+            with self.subTest(path=path):
+                self.assertTrue(cc.classify([path])["go"])
+
     def test_scanner_image_update_runs_containers(self) -> None:
         self.assertTrue(cc.classify(["tools/scanners/compose.yaml"])["containers"])
 

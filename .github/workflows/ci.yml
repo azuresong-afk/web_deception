@@ -124,6 +124,9 @@ jobs:
       - name: тесты с детектором гонок и порогом покрытия
         run: make test-go
 
+      - name: git-хуки — настоящие коммиты во временном репозитории
+        run: make test-hooks
+
       - name: сборка бинарника
         run: make build
 
@@ -231,6 +234,28 @@ jobs:
       - name: gitleaks
         run: make security-secrets
 
+  # Формат сообщений коммитов — только для pull request: на push в main
+  # проверять уже поздно, а в запуске по расписанию нечего проверять.
+  commits:
+    name: сообщения коммитов
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Conventional Commits
+        # SHA через env, как везде. Тексты коммитов скрипт печатает через
+        # repr(): первая строка коммита — текст автора PR, и строка лога,
+        # начинающаяся с "::", стала бы командой раннеру.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/check_commit_msg.py --range
+
   # Собственные правила Semgrep тоже запускаются всегда: правило про
   # GitHub Actions касается workflow, правила про логирование — любого кода.
   sast:
@@ -251,7 +276,7 @@ jobs:
   # с правкой документации ждал бы его вечно.
   ci-ok:
     name: ci-ok
-    needs: [changes, go, python, containers, secrets, sast]
+    needs: [changes, go, python, containers, secrets, sast, commits]
     # always(): запускаться даже если что-то упало — иначе при падении это
     # задание было бы пропущено, а пропуск засчитался бы как успех.
     if: always()
@@ -266,9 +291,11 @@ jobs:
           CONTAINERS: ${{ needs.containers.result }}
           SECRETS: ${{ needs.secrets.result }}
           SAST: ${{ needs.sast.result }}
+          COMMITS: ${{ needs.commits.result }}
+          EVENT: ${{ github.event_name }}
         run: |
           echo "changes=$CHANGES go=$GO python=$PYTHON containers=$CONTAINERS"
-          echo "secrets=$SECRETS sast=$SAST"
+          echo "secrets=$SECRETS sast=$SAST commits=$COMMITS"
 
           # Задание changes обязано пройти. Если оно упало, все остальные
           # будут пропущены — и без этой строки пропуск выглядел бы
@@ -286,6 +313,13 @@ jobs:
               exit 1
             fi
           done
+
+          # Для pull request проверка коммитов обязательна: её пропуск
+          # означал бы ошибку в самом workflow.
+          if [ "$EVENT" = "pull_request" ] && [ "$COMMITS" != "success" ]; then
+            echo "::error::проверка сообщений коммитов завершилась с результатом $COMMITS"
+            exit 1
+          fi
 
           # Остальные: успех или пропуск за ненадобностью. Всё прочее —
           # failure, cancelled — провал.

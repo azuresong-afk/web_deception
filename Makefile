@@ -58,7 +58,7 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
 .PHONY: help deps fmt fmt-go fmt-py lint lint-go lint-py lint-containers lint-workflows \
         security security-secrets security-go security-py security-sast \
         security-containers security-dockerfiles security-images \
-        test test-go test-py test-scripts \
+        test test-go test-py test-scripts test-hooks hooks \
         build run-sensor run-cp clean secrets images smoke dev dev-demo dev-ps dev-logs \
         dev-down dev-reset
 
@@ -70,6 +70,13 @@ help: ## Показать список доступных команд
 
 deps: ## Установить зависимости control plane по lock-файлу
 	cd $(CP_DIR) && $(UV) sync --all-groups
+
+# Git не устанавливает хуки из репозитория автоматически — иначе клонирование
+# чужого репозитория запускало бы чужой код. Поэтому включаются явно, один раз
+# на клон. Настройка пишется в .git/config этого клона и никуда не уходит.
+hooks: ## Включить git-хуки: секреты и формат перед коммитом, формат сообщения
+	git config core.hooksPath .githooks
+	@echo "Хуки включены: .githooks/pre-commit и .githooks/commit-msg"
 
 fmt: fmt-go fmt-py ## Отформатировать весь код
 
@@ -133,6 +140,13 @@ test-py:
 test-scripts:
 	@echo "==> scripts: unittest"
 	@$(UV) run --project $(CP_DIR) python -m unittest discover -s scripts
+
+# Хуки проверяются по-настоящему: во временном репозитории делаются коммиты
+# с секретом, с неотформатированным кодом и с плохим сообщением. Нужен Go
+# (для gitleaks), поэтому в CI этот тест идёт в задании Go.
+test-hooks:
+	@echo "==> git-хуки: интеграционный тест"
+	@python3 scripts/hooks_test.py
 
 build: ## Собрать бинарник сенсора в bin/
 	@mkdir -p $(BIN_DIR)
