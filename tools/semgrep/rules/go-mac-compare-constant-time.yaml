@@ -1,0 +1,44 @@
+# Сравнение MAC, подписей и дайджестов — только за постоянное время.
+#
+# Обычное сравнение (== или bytes.Equal) останавливается на первом
+# несовпавшем байте. По времени ответа атакующий узнаёт, сколько первых
+# байт он угадал, и подбирает подпись побайтово — это атака по времени
+# (timing attack). Для canary-токенов с HMAC (ADR-0006, угроза T7) это
+# значит подделку токена без знания ключа.
+#
+# CLAUDE.md: «Никакой собственной криптографии». Сравнение секретов — часть
+# криптографии, и для него есть стандартные функции: hmac.Equal
+# и crypto/subtle.ConstantTimeCompare.
+#
+# Сейчас такого кода в проекте нет: правило появляется до кода, который
+# оно проверяет (этап 8), и ловит ошибку в момент её написания.
+
+rules:
+  - id: go-mac-compare-constant-time
+    languages: [go]
+    severity: ERROR
+    message: >-
+      MAC, подпись или дайджест сравниваются обычным сравнением, время которого
+      зависит от числа совпавших байт. Используйте hmac.Equal или
+      subtle.ConstantTimeCompare. Угроза T7, ADR-0006.
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: bytes.Equal($A, $B)
+              - pattern: $A == $B
+              - pattern: $A != $B
+          - metavariable-regex:
+              metavariable: $A
+              # Имя переменной или поля, а не выражение вроде len(mac).
+              # Префикс необязателен: переменная может называться ровно
+              # signature — первая версия выражения этого не допускала,
+              # и ошибку поймал тест.
+              regex: (?i)^(?:[a-z_][a-z0-9_.]*)?(mac|signature|digest)[a-z0-9_]*$
+      - patterns:
+          - pattern-either:
+              - pattern: bytes.Equal($A, $B)
+              - pattern: $A == $B
+              - pattern: $A != $B
+          - metavariable-regex:
+              metavariable: $B
+              regex: (?i)^(?:[a-z_][a-z0-9_.]*)?(mac|signature|digest)[a-z0-9_]*$

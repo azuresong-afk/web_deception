@@ -1,0 +1,97 @@
+# Dependabot — автоматические PR с обновлениями зависимостей.
+#
+# Зачем. Всё в проекте закреплено: actions — по SHA, образы — по digest,
+# зависимости — с контрольными суммами. Закрепление защищает от подмены,
+# но само по себе замораживает версии, и без обновлений мы через месяц
+# надёжно закреплены на уязвимых. Dependabot делает обновление отдельным PR,
+# который проходит весь CI и ревью, как любое другое изменение.
+#
+# Отдельно от этих плановых обновлений Dependabot присылает срочные PR
+# для зависимостей с опубликованной уязвимостью — это включается
+# в настройках репозитория (Security → Dependabot security updates).
+
+version: 2
+
+updates:
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Выдержка: предлагать новую версию не раньше чем через 7 дней после
+    # её публикации. Вредоносные релизы — от угнанных учётных записей
+    # сопровождающих — обычно обнаруживают и отзывают за несколько дней.
+    # Кто обновляется в первый же час, получает их первым. На срочные
+    # обновления безопасности выдержка не действует.
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: gomod
+    directories:
+      - /sensor
+      - /tools/golangci-lint
+      - /tools/actionlint
+      - /tools/gitleaks
+      - /tools/govulncheck
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      go:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: build
+
+  - package-ecosystem: uv
+    directory: /controlplane
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      python:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: build
+
+  # uv для сборки образа и CI: deploy/docker/requirements-build.txt,
+  # вместе с контрольными суммами.
+  - package-ecosystem: pip
+    directory: /deploy/docker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+
+  # Базовые образы в Dockerfile: Dependabot обновляет и тег, и digest.
+  - package-ecosystem: docker
+    directory: /deploy/docker
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build
+
+  # Образы в compose: PostgreSQL, NATS, Juice Shop и сканеры безопасности.
+  # Устаревший сканер уязвимостей молча пропускает новые классы уязвимостей.
+  - package-ecosystem: docker-compose
+    directories:
+      - /deploy/compose
+      - /tools/scanners
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build

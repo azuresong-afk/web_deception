@@ -36,6 +36,10 @@ func call(t *testing.T, ready bool, method, path string) (response, string) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		// Это ошибка чтения (ввода-вывода), содержимого тела в ней нет. Общего
+		// исключения для ошибок в правиле нет намеренно: ошибки разбора включают
+		// входные данные — см. тест правила go-no-sensitive-http-logging.
+		// nosemgrep: go-no-sensitive-http-logging
 		t.Fatalf("не удалось прочитать тело ответа: %v", err)
 	}
 	return response{StatusCode: resp.StatusCode, Header: resp.Header}, string(body)

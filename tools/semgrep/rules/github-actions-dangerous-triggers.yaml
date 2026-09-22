@@ -1,0 +1,30 @@
+# Запрет событий, которые запускают workflow с правами основного репозитория
+# для кода, пришедшего извне.
+#
+# pull_request_target исполняется в контексте основного репозитория — с его
+# секретами и токеном на запись, — но обычно для того, чтобы проверить код
+# из PR. Для PR из форка это чужой код с нашими правами.
+# workflow_run запускается после другого workflow, тоже с правами основного
+# репозитория, и часто обрабатывает артефакты, собранные из кода PR.
+# Угроза T12, ADR-0015.
+#
+# Если однажды такое событие действительно понадобится, это решение
+# для отдельного ADR, а не для одной строки в workflow.
+
+rules:
+  - id: github-actions-dangerous-triggers
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      Событие pull_request_target или workflow_run выполняет workflow с правами
+      основного репозитория для кода или артефактов из pull request. Используйте
+      pull_request. Угроза T12, ADR-0015.
+    pattern-either:
+      - pattern: "on: pull_request_target"
+      - pattern: "on: workflow_run"
+      - pattern: "on: [..., pull_request_target, ...]"
+      - pattern: "on: [..., workflow_run, ...]"
+      # Ключ события внутри блока on:. Такие ключи в workflow ничего другого
+      # не означают, поэтому ищем их без привязки к родителю.
+      - pattern: "pull_request_target: $X"
+      - pattern: "workflow_run: $X"

@@ -1,0 +1,33 @@
+# Тестовые примеры для правила github-actions-dangerous-triggers.
+# Одно событие на файл в YAML не уложить, поэтому примеры — отдельные
+# документы, разделённые "---".
+# ruleid: github-actions-dangerous-triggers
+on: pull_request_target
+---
+# ruleid: github-actions-dangerous-triggers
+on: [push, pull_request_target]
+---
+on:
+  push:
+    branches: [main]
+  # ruleid: github-actions-dangerous-triggers
+  pull_request_target:
+    types: [opened]
+---
+on:
+  # ruleid: github-actions-dangerous-triggers
+  workflow_run:
+    workflows: [ci]
+---
+# ok: github-actions-dangerous-triggers
+on: pull_request
+---
+on:
+  # Событие без параметров — тоже должно ловиться.
+  # ruleid: github-actions-dangerous-triggers
+  pull_request_target:
+---
+on:
+  # ok: github-actions-dangerous-triggers
+  pull_request:
+    branches: [main]

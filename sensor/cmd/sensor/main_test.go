@@ -33,6 +33,10 @@ func httpGet(t *testing.T, url string) (int, string) {
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		// Это ошибка чтения (ввода-вывода), содержимого тела в ней нет. Общего
+		// исключения для ошибок в правиле нет намеренно: ошибки разбора включают
+		// входные данные — см. тест правила go-no-sensitive-http-logging.
+		// nosemgrep: go-no-sensitive-http-logging
 		t.Fatalf("не удалось прочитать тело ответа %s: %v", url, err)
 	}
 	return resp.StatusCode, string(body)

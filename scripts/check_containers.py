@@ -45,6 +45,10 @@ from typing import Any
 # давать один и тот же результат, откуда бы её ни запустили.
 ROOT = Path(__file__).resolve().parent.parent
 COMPOSE_FILE = ROOT / "deploy" / "compose" / "compose.yaml"
+# Сканеры безопасности подчиняются тем же правилам, что и продукт:
+# они видят весь исходный код.
+SCANNERS_COMPOSE_FILE = ROOT / "tools" / "scanners" / "compose.yaml"
+COMPOSE_FILES = (COMPOSE_FILE, SCANNERS_COMPOSE_FILE)
 DOCKERFILES_DIR = ROOT / "deploy" / "docker"
 
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
@@ -65,15 +69,15 @@ class Violation:
 # --------------------------------------------------------------- compose ---
 
 
-def check_compose(model: dict[str, Any]) -> list[Violation]:
+def check_compose(model: dict[str, Any], label: str = "compose") -> list[Violation]:
     """Проверяет нормализованную модель docker compose."""
     violations: list[Violation] = []
     services = model.get("services")
     if not isinstance(services, dict):
-        return [Violation("compose", "C0", "в модели нет раздела services")]
+        return [Violation(label, "C0", "в модели нет раздела services")]
 
     for name, service in sorted(services.items()):
-        where = f"compose: сервис {name}"
+        where = f"{label}: сервис {name}"
         violations.extend(_check_service(where, service))
 
     return violations
@@ -262,7 +266,10 @@ def load_compose_model(compose_file: Path) -> dict[str, Any]:
 
 
 def main() -> int:
-    violations = check_compose(load_compose_model(COMPOSE_FILE))
+    violations: list[Violation] = []
+    for compose_file in COMPOSE_FILES:
+        label = str(compose_file.relative_to(ROOT))
+        violations.extend(check_compose(load_compose_model(compose_file), label))
     dockerfiles = sorted(DOCKERFILES_DIR.glob("*.Dockerfile"))
     for path in dockerfiles:
         where = str(path.relative_to(ROOT))
@@ -275,7 +282,10 @@ def main() -> int:
         sys.stderr.write(f"\nнарушений политики контейнеров: {len(violations)}\n")
         return 1
 
-    sys.stdout.write(f"политика контейнеров соблюдена: compose и {len(dockerfiles)} Dockerfile\n")
+    sys.stdout.write(
+        f"политика контейнеров соблюдена: {len(COMPOSE_FILES)} compose-файла "
+        f"и {len(dockerfiles)} Dockerfile\n"
+    )
     return 0
 
 

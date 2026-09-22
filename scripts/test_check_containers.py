@@ -155,8 +155,10 @@ class RepositoryFilesTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("docker"), "нужен docker CLI")
     def test_compose(self) -> None:
-        model = cc.load_compose_model(cc.COMPOSE_FILE)
-        self.assertEqual(cc.check_compose(model), [])
+        for compose_file in cc.COMPOSE_FILES:
+            with self.subTest(compose=compose_file.name):
+                model = cc.load_compose_model(compose_file)
+                self.assertEqual(cc.check_compose(model), [])
 
 
 if __name__ == "__main__":

@@ -5,8 +5,8 @@
 # классическая ситуация «локально зелено, в CI красно» — и доверие к проверкам
 # пропадает, а вместе с ним и польза от них.
 #
-# Цели `security` появится на шаге 6. Пока её нет намеренно: цель, которая
-# ничего не делает и печатает «успех», опаснее отсутствующей.
+# `make security` запускает все проверки безопасности, кроме CodeQL: его
+# анализ требует большой загрузки и выполняется только в CI.
 
 GO ?= go
 UV ?= uv
@@ -24,6 +24,19 @@ COMPOSE := docker compose -f deploy/compose/compose.yaml
 # зависимости максимальную из нужных версий — так golangci-lint притянул
 # новую YAML-библиотеку, с которой actionlint перестал компилироваться.
 GOLANGCI := $(GO) tool -modfile=../tools/golangci-lint/go.mod golangci-lint
+
+# Сканеры в контейнерах: версии образов, ограничения и отключённая сеть
+# описаны в tools/scanners/compose.yaml. UID и GID передаются, чтобы
+# сканеры работали не от root и создавали файлы от имени пользователя.
+# SCANNER_RUN_ARGS — дополнительные аргументы docker compose run, например
+# сертификат корпоративного прокси с перехватом TLS.
+SCANNER_RUN_ARGS ?=
+SCANNERS := SCANNER_UID=$$(id -u) SCANNER_GID=$$(id -g) \
+	docker compose -f tools/scanners/compose.yaml run --rm --quiet-pull $(SCANNER_RUN_ARGS)
+
+# База уязвимостей Go. Переменная — чтобы можно было указать зеркало там,
+# где официальный адрес закрыт (например, в корпоративной сети с прокси).
+GOVULNDB ?= https://vuln.go.dev
 
 # Минимальное покрытие кода сенсора тестами, в процентах.
 #
@@ -43,6 +56,8 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
 .DEFAULT_GOAL := help
 
 .PHONY: help deps fmt fmt-go fmt-py lint lint-go lint-py lint-containers lint-workflows \
+        security security-secrets security-go security-py security-sast \
+        security-containers security-dockerfiles security-images \
         test test-go test-py test-scripts \
         build run-sensor run-cp clean secrets images smoke dev dev-demo dev-ps dev-logs \
         dev-down dev-reset
@@ -52,10 +67,6 @@ help: ## Показать список доступных команд
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
-	@echo ""
-	@echo "Появится по ходу этапа 1:"
-	@echo "  security     gitleaks, semgrep, govulncheck,"
-	@echo "               pip-audit, trivy                    (шаг 6)"
 
 deps: ## Установить зависимости control plane по lock-файлу
 	cd $(CP_DIR) && $(UV) sync --all-groups
@@ -79,8 +90,9 @@ lint-go:
 	@# не должна попасть зависимость, которой нет в go.sum, и лишняя, которой
 	@# не пользуется код.
 	@cd $(SENSOR_DIR) && $(GO) mod tidy -diff
-	@cd tools/golangci-lint && $(GO) mod tidy -diff
-	@cd tools/actionlint && $(GO) mod tidy -diff
+	@for tool in golangci-lint actionlint gitleaks govulncheck; do \
+		(cd tools/$$tool && $(GO) mod tidy -diff) || exit 1; \
+	done
 
 lint-py:
 	@echo "==> control plane и scripts: ruff"
@@ -135,6 +147,79 @@ run-sensor: ## Запустить сенсор на 127.0.0.1:9090
 
 run-cp: ## Запустить control plane на 127.0.0.1:8000
 	cd $(CP_DIR) && PYTHONPATH=src $(UV) run python -m webdeception_cp
+
+# --- Проверки безопасности -------------------------------------------------
+
+security: security-secrets security-go security-py security-sast security-containers ## Проверки безопасности: секреты, уязвимости, SAST, образы
+
+# gitleaks по всей истории git, а не только по текущим файлам: удалённый
+# в следующем коммите секрет остаётся в истории навсегда. --redact скрывает
+# найденные значения в выводе — логи CI публичного репозитория видны всем.
+security-secrets:
+	@echo "==> секреты в истории git: gitleaks"
+	@cd tools/gitleaks && $(GO) tool gitleaks git --config ../../.gitleaks.toml \
+		--redact --no-banner ../..
+
+# govulncheck проверяет не просто «есть ли уязвимая версия в зависимостях»,
+# а «вызывает ли наш код уязвимую функцию» — анализ достижимости. Падает
+# только на реально достижимых уязвимостях, остальные упоминает для сведения.
+# Стандартная библиотека Go тоже проверяется: уязвимость в net/http
+# сенсора — это уязвимость сенсора.
+security-go:
+	@echo "==> уязвимости Go: govulncheck"
+	@cd $(SENSOR_DIR) && $(GO) tool -modfile=../tools/govulncheck/go.mod govulncheck \
+		-db $(GOVULNDB) ./...
+
+# pip-audit проверяет ВСЕ зависимости из uv.lock, включая группу разработки:
+# инструменты разработки исполняются в CI и на машинах разработчиков, и уязвимость
+# в них — тоже путь внутрь. Проверка идёт по экспорту lock-файла с контрольными
+# суммами, ничего не устанавливая (--disable-pip).
+CP_REQUIREMENTS := $(CP_DIR)/.requirements-audit.txt
+security-py:
+	@echo "==> уязвимости Python: pip-audit"
+	@cd $(CP_DIR) && $(UV) export --frozen --all-groups --no-emit-project \
+		--format requirements.txt --quiet -o .requirements-audit.txt
+	@cd $(CP_DIR) && $(UV) run pip-audit --requirement .requirements-audit.txt \
+		--require-hashes --disable-pip --strict --progress-spinner off
+	@rm -f $(CP_REQUIREMENTS)
+
+# Собственные правила Semgrep из tools/semgrep/rules. Сначала тесты самих
+# правил: каждое обязано сработать на примерах нарушений и промолчать
+# на корректном коде. Правило без такого теста может не работать вовсе
+# и всё равно показывать «чисто». Потом — проверка кода проекта.
+# --metrics=off: Semgrep по умолчанию отправляет статистику использования.
+SEMGREP_FLAGS := --metrics=off --disable-version-check
+security-sast:
+	@echo "==> собственные правила Semgrep: тесты правил"
+	@$(SCANNERS) semgrep --test $(SEMGREP_FLAGS) tools/semgrep/rules
+	@echo "==> собственные правила Semgrep: код проекта"
+	@$(SCANNERS) semgrep scan --config tools/semgrep/rules $(SEMGREP_FLAGS) --error --quiet .
+
+security-containers: security-dockerfiles images security-images
+
+security-dockerfiles:
+	@echo "==> Dockerfile: hadolint"
+	@$(SCANNERS) hadolint --no-color deploy/docker/sensor.Dockerfile deploy/docker/controlplane.Dockerfile
+
+# Trivy сканирует уже собранные образы (make images). Образы передаются
+# ему файлами, а не через сокет Docker: сокет — это полный контроль над хостом.
+#
+# Политика: проверка падает на уязвимостях HIGH и CRITICAL, для которых есть
+# исправление. Уязвимости без исправления показываются в сводке, но не валят
+# проверку: обновиться не на что, а постоянно красный CI приучает его не
+# читать. Это осознанно принятый риск — см. ADR-0016.
+TRIVY_FLAGS := image --scanners vuln --severity HIGH,CRITICAL --no-progress
+security-images:
+	@mkdir -p bin/images .cache/trivy
+	@docker save webdeception/sensor:dev -o bin/images/sensor.tar
+	@docker save webdeception/controlplane:dev -o bin/images/controlplane.tar
+	@echo "==> образы: Trivy, сводка HIGH и CRITICAL, включая без исправлений"
+	@$(SCANNERS) trivy $(TRIVY_FLAGS) --table-mode summary --input /src/bin/images/sensor.tar
+	@$(SCANNERS) trivy $(TRIVY_FLAGS) --table-mode summary --skip-db-update --input /src/bin/images/controlplane.tar
+	@echo "==> образы: Trivy, проверка — уязвимости с доступным исправлением"
+	@$(SCANNERS) trivy $(TRIVY_FLAGS) --ignore-unfixed --exit-code 1 --skip-db-update --input /src/bin/images/sensor.tar
+	@$(SCANNERS) trivy $(TRIVY_FLAGS) --ignore-unfixed --exit-code 1 --skip-db-update --input /src/bin/images/controlplane.tar
+	@rm -f bin/images/sensor.tar bin/images/controlplane.tar
 
 # --- Локальный стек в docker compose ---------------------------------------
 
