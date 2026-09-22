@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,10 +25,24 @@ import (
 
 	"github.com/azuresong-afk/web_deception/sensor/internal/admin"
 	"github.com/azuresong-afk/web_deception/sensor/internal/config"
+	"github.com/azuresong-afk/web_deception/sensor/internal/healthcheck"
 	"github.com/azuresong-afk/web_deception/sensor/internal/version"
 )
 
 func main() {
+	// Разбор аргументов без библиотеки флагов: вариантов ровно два, и любой
+	// третий — ошибка, а не повод молча его проигнорировать. Проигнорированный
+	// аргумент — это настройка, которую администратор считает действующей.
+	switch {
+	case len(os.Args) == 1:
+		// Обычный запуск сервера — ниже.
+	case len(os.Args) == 2 && os.Args[1] == "healthcheck":
+		os.Exit(runHealthcheck(os.Getenv, os.Stderr))
+	default:
+		fmt.Fprintln(os.Stderr, "использование: sensor [healthcheck]")
+		os.Exit(2)
+	}
+
 	cfg, err := config.Load(os.Getenv)
 	if err != nil {
 		// Логгер ещё не создан: его уровень берётся из конфигурации,
@@ -145,4 +160,30 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 
 	logger.Info("сенсор остановлен")
 	return <-serveErr
+}
+
+// runHealthcheck выполняет одну проверку готовности и возвращает код выхода.
+//
+// Возвращает только 0 или 1. Docker трактует 0 как «здоров», 1 как «нездоров»,
+// а код 2 зарезервирован и использовать его в проверке здоровья запрещено
+// документацией Docker. Поэтому здесь даже ошибка конфигурации даёт 1,
+// хотя обычный запуск при ней завершается с кодом 2.
+func runHealthcheck(getenv config.Getenv, stderr io.Writer) int {
+	cfg, err := config.Load(getenv)
+	if err != nil {
+		fmt.Fprintf(stderr, "healthcheck: ошибка конфигурации: %v\n", err)
+		return 1
+	}
+
+	url, err := healthcheck.TargetURL(cfg.AdminAddr)
+	if err != nil {
+		fmt.Fprintf(stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+
+	if err := healthcheck.Probe(context.Background(), url); err != nil {
+		fmt.Fprintf(stderr, "healthcheck: %v\n", err)
+		return 1
+	}
+	return 0
 }

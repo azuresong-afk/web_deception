@@ -91,8 +91,14 @@ src/webdeception_cp/
     app.py        приложение FastAPI, эндпоинты, обработка ошибок
     config.py     чтение и проверка переменных окружения
     log.py        формат структурированного лога
+    healthcheck.py  самопроверка для Docker: python -m webdeception_cp.healthcheck
     version.py    версия сборки (только для логов, не для HTTP-ответов)
 tests/            тесты, по файлу на модуль
 pyproject.toml    зависимости и настройки всех инструментов
 uv.lock           точные версии и контрольные суммы — коммитится в репозиторий
 ```
+
+Control plane не собирается в Python-пакет (`package = false` в `pyproject.toml`):
+сборка пакета запускает build backend, который скачивался бы при каждой сборке
+мимо lock-файла. Код подключается через `PYTHONPATH=src` — `make run-cp`
+и Dockerfile делают это сами.

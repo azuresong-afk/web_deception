@@ -1,0 +1,165 @@
+# Весь стек для локальной разработки одной командой: make dev
+#
+# Правила, которым подчиняется каждый сервис (проверяются автоматически
+# скриптом scripts/check_containers.py в `make lint`):
+#   - образ закреплён по digest, тег latest запрещён;
+#   - процесс работает не от root;
+#   - все capabilities Linux сброшены, повышение привилегий запрещено;
+#   - порты публикуются только на 127.0.0.1 хоста.
+
+name: webdeception
+
+# Общий блок защиты. YAML-якорь (&hardening) подставляется в сервисы
+# строкой "<<: *hardening": правило, которое пишется один раз, невозможно
+# забыть в одном из сервисов.
+x-hardening: &hardening
+  # Capabilities — это части прав root: открыть порт ниже 1024, сменить
+  # владельца файла, обойти права доступа, загрузить модуль ядра. Нашим
+  # сервисам не нужна ни одна, поэтому сбрасываем все.
+  cap_drop: [ALL]
+  # Запрещает процессу получить права больше, чем у него были при старте,
+  # например через исполняемый файл с битом setuid.
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  # Без ротации лог контейнера растёт, пока не кончится диск. Бесконечный
+  # поток запросов к сенсору не должен превращаться в отказ всего хоста.
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+
+  sensor:
+    <<: *hardening
+    build:
+      context: ../..
+      dockerfile: deploy/docker/sensor.Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+    image: webdeception/sensor:dev
+    user: "65532:65532"
+    # Корневая файловая система только для чтения: атакующий, получивший
+    # выполнение кода, не сможет ни подменить бинарник, ни положить рядом свой.
+    read_only: true
+    environment:
+      SENSOR_LOG_LEVEL: info
+    # Порты не публикуются: служебный слушатель нужен только проверке здоровья
+    # внутри контейнера. Порт для клиентского трафика появится на этапе 2.
+    networks: [backend]
+    # Лимиты — сдерживание отказа в обслуживании (угроза T3): утечка памяти
+    # или вышедший из-под контроля процесс не утащат за собой весь хост.
+    mem_limit: 128m
+    pids_limit: 128
+
+  controlplane:
+    <<: *hardening
+    build:
+      context: ../..
+      dockerfile: deploy/docker/controlplane.Dockerfile
+    image: webdeception/controlplane:dev
+    user: "10001:10001"
+    read_only: true
+    environment:
+      # Внутри контейнера слушаем все интерфейсы — иначе Docker не сможет
+      # пробросить порт. Граница сети проходит не здесь, а в строке ports ниже:
+      # на хосте порт открыт только для 127.0.0.1. Предупреждение в логе
+      # при этом остаётся — оно честное, и мы его осознанно принимаем.
+      CP_HOST: 0.0.0.0
+      CP_PORT: "8000"
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    # backend — к базе и очереди; edge — чтобы порт можно было опубликовать
+    # на хост (у изолированной сети нет выхода к хосту).
+    networks: [backend, edge]
+    mem_limit: 256m
+    pids_limit: 128
+
+  postgres:
+    <<: *hardening
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    # Образ по умолчанию стартует от root и понижает права сам. Мы запускаем
+    # сразу от пользователя postgres (UID 70 в alpine-образе): процессу,
+    # который никогда не был root, нечего «понижать».
+    user: "70:70"
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql
+      - /tmp
+    environment:
+      POSTGRES_DB: webdeception
+      POSTGRES_USER: webdeception
+      # Пароль передаётся файлом, а не переменной окружения. Переменные
+      # окружения видны в `docker inspect`, в /proc/<pid>/environ и наследуются
+      # всеми дочерними процессами. Файл виден только тому, кто его читает.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username=webdeception", "--dbname=webdeception"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Только изолированная сеть: у базы нет ни выхода в интернет, ни порта на хосте.
+    networks: [backend]
+    mem_limit: 512m
+    pids_limit: 256
+
+  nats:
+    <<: *hardening
+    image: nats:2.12-alpine@sha256:b270f5e2428354c0335612694d7dd2fb588148e567a5757fdff325ef9c9332e6
+    # Образ по умолчанию работает от root, своего пользователя в нём нет.
+    user: "10002:10002"
+    read_only: true
+    volumes:
+      # Своя конфигурация вместо файла из образа — см. комментарий в nats.conf.
+      - ./nats.conf:/etc/nats/nats-server.conf:ro
+    tmpfs:
+      - /data:uid=10002,gid=10002,mode=0700
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [backend]
+    mem_limit: 256m
+    pids_limit: 128
+
+  # Уязвимое учебное приложение OWASP Juice Shop — цель для проверки
+  # сенсора на этапе 2. Запускается только в профиле demo: make dev-demo.
+  juice-shop:
+    <<: *hardening
+    image: bkimminich/juice-shop:v19.0.0@sha256:2765a26de7647609099a338d5b7f61085d95903c8703bb70f03fcc4b12f0818d
+    profiles: [demo]
+    user: "65532:65532"
+    # Файловая система НЕ только для чтения: приложение пишет свою базу и логи.
+    ports:
+      - "127.0.0.1:3000:3000"
+    # Намеренно уязвимое приложение не должно видеть нашу инфраструктуру:
+    # только сеть edge, в backend к базе и очереди его не пускаем.
+    networks: [edge]
+    mem_limit: 512m
+    pids_limit: 256
+
+networks:
+  # internal: true — у сети нет выхода наружу. Контейнеры в ней видят друг
+  # друга, но не интернет. Скомпрометированная база не сможет выгрузить
+  # данные на сервер атакующего напрямую.
+  backend:
+    internal: true
+  edge: {}
+
+volumes:
+  pgdata: {}
+
+secrets:
+  postgres_password:
+    # Файл создаётся командой `make secrets` и в git не попадает.
+    file: ./secrets/postgres_password

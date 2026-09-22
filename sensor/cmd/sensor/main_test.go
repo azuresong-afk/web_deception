@@ -129,3 +129,65 @@ func TestRunFailsWhenAddressIsBusy(t *testing.T) {
 		t.Fatal("ожидалась ошибка при занятом порте, получен nil")
 	}
 }
+
+// TestHealthcheckCommand проверяет подкоманду так, как её вызывает Docker:
+// по адресу из переменной окружения, с кодом выхода 0 или 1.
+func TestHealthcheckCommand(t *testing.T) {
+	cfg := &config.Config{
+		AdminAddr:       "127.0.0.1:0",
+		ShutdownTimeout: 5 * time.Second,
+		LogLevel:        slog.LevelError,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addrCh := make(chan net.Addr, 1)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- run(ctx, cfg, silentLogger(), func(a net.Addr) { addrCh <- a })
+	}()
+
+	var addr string
+	select {
+	case a := <-addrCh:
+		addr = a.String()
+	case <-time.After(10 * time.Second):
+		t.Fatal("сенсор не открыл слушатель за 10 секунд")
+	}
+
+	env := func(k string) string {
+		if k == "SENSOR_ADMIN_ADDR" {
+			return addr
+		}
+		return ""
+	}
+
+	if code := runHealthcheck(env, io.Discard); code != 0 {
+		t.Errorf("проверка работающего сенсора вернула %d, ожидался 0", code)
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("остановка вернула ошибку: %v", err)
+	}
+
+	if code := runHealthcheck(env, io.Discard); code != 1 {
+		t.Errorf("проверка остановленного сенсора вернула %d, ожидалась 1", code)
+	}
+}
+
+// TestHealthcheckNeverReturnsTwo закрепляет требование Docker: код 2
+// в проверке здоровья зарезервирован, даже при ошибке конфигурации.
+func TestHealthcheckNeverReturnsTwo(t *testing.T) {
+	env := func(k string) string {
+		if k == "SENSOR_SHUTDOWN_TIMEOUT" {
+			return "не-длительность"
+		}
+		return ""
+	}
+
+	if code := runHealthcheck(env, io.Discard); code != 1 {
+		t.Errorf("при ошибке конфигурации получен код %d, ожидалась 1", code)
+	}
+}
