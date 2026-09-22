@@ -11,7 +11,8 @@ compose/secrets/                  локальные секреты; созда�
 
 Запуск — из корня репозитория: `make dev`, `make dev-demo`, `make dev-down`.
 Как устроены сети, какие правила действуют для каждого контейнера и почему —
-в [ADR-0014](../docs/adr/0014-containers.md).
+в [docs/guide.md](../docs/guide.md#локальный-стек-docker-compose) и
+[ADR-0014](../docs/adr/0014-containers.md).
 
 Правила проверяются автоматически в `make lint` скриптом
 [scripts/check_containers.py](../scripts/check_containers.py): образы по digest,
