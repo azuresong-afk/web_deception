@@ -15,6 +15,16 @@ CP_DIR := controlplane
 BIN_DIR := bin
 COMPOSE := docker compose -f deploy/compose/compose.yaml
 
+# Инструменты Go запускаются из модулей в tools/: версия каждого и контрольные
+# суммы всех его зависимостей закреплены в go.sum, поэтому у вас, у меня
+# и в CI это один и тот же бинарник. Первый запуск собирает инструмент
+# (около минуты), дальше он берётся из кеша сборки Go.
+#
+# У каждого инструмента свой модуль. В общем модуле Go выбирает для общей
+# зависимости максимальную из нужных версий — так golangci-lint притянул
+# новую YAML-библиотеку, с которой actionlint перестал компилироваться.
+GOLANGCI := $(GO) tool -modfile=../tools/golangci-lint/go.mod golangci-lint
+
 # Минимальное покрытие кода сенсора тестами, в процентах.
 #
 # Покрытие измеряет «какие строки выполнились», а не «что проверено»:
@@ -32,9 +42,10 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
 
 .DEFAULT_GOAL := help
 
-.PHONY: help deps fmt fmt-go fmt-py lint lint-go lint-py lint-containers \
+.PHONY: help deps fmt fmt-go fmt-py lint lint-go lint-py lint-containers lint-workflows \
         test test-go test-py test-scripts \
-        build run-sensor run-cp clean secrets dev dev-demo dev-ps dev-logs dev-down dev-reset
+        build run-sensor run-cp clean secrets images smoke dev dev-demo dev-ps dev-logs \
+        dev-down dev-reset
 
 help: ## Показать список доступных команд
 	@echo "Web-Deception — доступные команды:"
@@ -52,25 +63,24 @@ deps: ## Установить зависимости control plane по lock-ф�
 fmt: fmt-go fmt-py ## Отформатировать весь код
 
 fmt-go:
-	cd $(SENSOR_DIR) && $(GO) fmt ./...
+	cd $(SENSOR_DIR) && $(GOLANGCI) fmt ./...
 
 fmt-py:
 	cd $(CP_DIR) && $(UV) run ruff format . ../scripts
 	cd $(CP_DIR) && $(UV) run ruff check --fix . ../scripts
 
-lint: lint-go lint-py lint-containers ## Проверить формат, стиль, типы и политику контейнеров
+lint: lint-go lint-py lint-containers lint-workflows ## Формат, стиль, типы, политика контейнеров, workflow
 
 lint-go:
-	@echo "==> sensor: gofmt"
-	@unformatted="$$(cd $(SENSOR_DIR) && gofmt -l .)"; \
-	if [ -n "$$unformatted" ]; then \
-		echo "Файлы не отформатированы, запустите make fmt:"; \
-		echo "$$unformatted"; \
-		exit 1; \
-	fi
-	@echo "==> sensor: go vet"
-	@cd $(SENSOR_DIR) && $(GO) vet ./...
-	@echo "OK. Полный линтер golangci-lint подключается в CI на шаге 5."
+	@echo "==> sensor: golangci-lint (включая gofmt, go vet, gosec)"
+	@cd $(SENSOR_DIR) && $(GOLANGCI) run ./...
+	@echo "==> go.mod и go.sum соответствуют коду"
+	@# tidy -diff падает, если go.mod или go.sum нужно поправить: в репозиторий
+	@# не должна попасть зависимость, которой нет в go.sum, и лишняя, которой
+	@# не пользуется код.
+	@cd $(SENSOR_DIR) && $(GO) mod tidy -diff
+	@cd tools/golangci-lint && $(GO) mod tidy -diff
+	@cd tools/actionlint && $(GO) mod tidy -diff
 
 lint-py:
 	@echo "==> control plane и scripts: ruff"
@@ -79,6 +89,14 @@ lint-py:
 	@echo "==> control plane и scripts: mypy"
 	@cd $(CP_DIR) && $(UV) run mypy
 	@cd $(CP_DIR) && $(UV) run mypy --strict ../scripts
+
+# Workflow GitHub Actions — тоже код, причём с правами на репозиторий:
+# опечатка в условии или в permissions тихо ослабляет CI.
+lint-workflows:
+	@echo "==> workflow: actionlint"
+	@# Запуск из каталога модуля: -modfile требует go.mod в текущем каталоге,
+	@# а в корне репозитория его нет. Файлы workflow передаются явно.
+	@cd tools/actionlint && $(GO) tool actionlint ../../.github/workflows/*.yml
 
 # Правила CLAUDE.md про контейнеры как проверка: digest вместо тегов, не root,
 # сброшенные capabilities, порты только на 127.0.0.1. Нужен docker CLI.
@@ -122,6 +140,14 @@ run-cp: ## Запустить control plane на 127.0.0.1:8000
 
 secrets: ## Создать локальные секреты (существующие не перезаписываются)
 	@sh scripts/gen-secrets.sh
+
+images: ## Собрать образы сенсора и control plane
+	VERSION=$(VERSION) $(COMPOSE) build
+
+smoke: ## Поднять стек, убедиться в готовности, остановить и удалить данные
+	$(MAKE) dev
+	curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8000/readyz
+	$(MAKE) dev-reset
 
 dev: secrets ## Поднять весь стек и дождаться готовности всех сервисов
 	VERSION=$(VERSION) $(COMPOSE) up --build --detach --wait
