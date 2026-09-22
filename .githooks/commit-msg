@@ -1,0 +1,15 @@
+#!/bin/sh
+# Хук commit-msg: сообщение коммита в формате Conventional Commits.
+# Правила и их обоснование — в scripts/check_commit_msg.py и CONTRIBUTING.md.
+# Та же проверка идёт в CI для всех коммитов pull request.
+
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "commit-msg: python3 не найден — формат сообщения не проверен, это сделает CI." >&2
+    exit 0
+fi
+
+exec python3 "$root/scripts/check_commit_msg.py" --file "$1"
