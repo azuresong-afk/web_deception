@@ -1,0 +1,31 @@
+# .editorconfig — единый стиль файлов для любого редактора.
+#
+# Зачем: без этого один человек сохраняет файл с табами и CRLF, другой
+# с пробелами и LF, и ревью превращается в чтение diff'ов о пробелах вместо
+# diff'ов о смысле. Для вас как ревьюера это напрямую про безопасность:
+# в шумном diff'е легко не заметить настоящее изменение.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Go форматируется табами — этого требует gofmt, спорить с ним бессмысленно
+[*.go]
+indent_style = tab
+
+[*.{yml,yaml,json,md}]
+indent_size = 2
+
+# Markdown: два пробела в конце строки — это перенос строки, их нельзя срезать
+[*.md]
+trim_trailing_whitespace = false
+
+# Makefile физически не работает с пробелами вместо табов
+[Makefile]
+indent_style = tab
