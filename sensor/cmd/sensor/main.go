@@ -98,7 +98,12 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	// сенсор должен упасть сразу с понятной ошибкой. Вариант с
 	// ListenAndServe внутри горутины приводит к тому, что процесс
 	// рапортует об успешном старте и молча не слушает ничего.
-	ln, err := net.Listen("tcp", cfg.AdminAddr)
+	//
+	// ListenConfig с контекстом, а не просто net.Listen: если в адресе имя
+	// хоста, его разрешение при старте может зависнуть, и без контекста
+	// такое зависание нельзя прервать даже сигналом остановки.
+	var lc net.ListenConfig
+	ln, err := lc.Listen(ctx, "tcp", cfg.AdminAddr)
 	if err != nil {
 		return fmt.Errorf("не удалось открыть служебный слушатель на %s: %w", cfg.AdminAddr, err)
 	}
@@ -171,18 +176,18 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 func runHealthcheck(getenv config.Getenv, stderr io.Writer) int {
 	cfg, err := config.Load(getenv)
 	if err != nil {
-		fmt.Fprintf(stderr, "healthcheck: ошибка конфигурации: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "healthcheck: ошибка конфигурации: %v\n", err)
 		return 1
 	}
 
 	url, err := healthcheck.TargetURL(cfg.AdminAddr)
 	if err != nil {
-		fmt.Fprintf(stderr, "healthcheck: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "healthcheck: %v\n", err)
 		return 1
 	}
 
 	if err := healthcheck.Probe(context.Background(), url); err != nil {
-		fmt.Fprintf(stderr, "healthcheck: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "healthcheck: %v\n", err)
 		return 1
 	}
 	return 0

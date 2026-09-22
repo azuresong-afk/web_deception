@@ -10,9 +10,19 @@ import (
 	"testing"
 )
 
-// call выполняет запрос к обработчику без поднятия настоящего сервера
-// и возвращает ответ вместе с прочитанным телом.
-func call(t *testing.T, ready bool, method, path string) (*http.Response, string) {
+// response — всё, что тестам нужно знать об ответе.
+type response struct {
+	StatusCode int
+	Header     http.Header
+}
+
+// call выполняет запрос к обработчику без поднятия настоящего сервера.
+//
+// Возвращает код, заголовки и прочитанное тело, но не сам *http.Response:
+// тело закрывается здесь же, и открытый ответ не выходит за пределы функции.
+// Так закрытие видно и читателю, и линтеру bodyclose, а не держится
+// на t.Cleanup, который линтер проследить не может.
+func call(t *testing.T, ready bool, method, path string) (response, string) {
 	t.Helper()
 
 	var flag atomic.Bool
@@ -22,13 +32,13 @@ func call(t *testing.T, ready bool, method, path string) (*http.Response, string
 	NewHandler(&flag).ServeHTTP(rec, httptest.NewRequest(method, path, nil))
 
 	resp := rec.Result()
-	t.Cleanup(func() { _ = resp.Body.Close() })
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("не удалось прочитать тело ответа: %v", err)
 	}
-	return resp, string(body)
+	return response{StatusCode: resp.StatusCode, Header: resp.Header}, string(body)
 }
 
 func TestHealthzAnswersEvenWhenNotReady(t *testing.T) {
