@@ -45,7 +45,7 @@ deploy/          Dockerfile'ы и docker compose
 test/            интеграционные и e2e тесты (unit-тесты лежат рядом с кодом)
 tools/semgrep/   собственные правила статического анализа
 scripts/         вспомогательные скрипты для Makefile и хуков
-docs/            модель угроз, ADR, глоссарий
+docs/            модель угроз, ADR, глоссарий, учебные разборы
 ```
 
 Обоснование структуры — [ADR-0010](docs/adr/0010-repo-structure.md).
@@ -55,10 +55,11 @@ docs/            модель угроз, ADR, глоссарий
 | Документ | О чём |
 |---|---|
 | [docs/guide.md](docs/guide.md) | **с чего начать**: как устроен продукт, модуль за модулем |
-| [docs/threat-model.md](docs/threat-model.md) | модель угроз по STRIDE: 13 угроз, меры и 3 принятых риска |
+| [docs/threat-model.md](docs/threat-model.md) | модель угроз по STRIDE: 16 угроз, меры и 6 принятых рисков |
 | [docs/roadmap.md](docs/roadmap.md) | чек-лист шагов по этапам и технический долг |
 | [docs/adr/](docs/adr/) | архитектурные решения: контекст, альтернативы, последствия |
 | [docs/glossary.md](docs/glossary.md) | термины простым языком |
+| [docs/learning/](docs/learning/) | учебные разборы: как это работает внутри и как читать Go-код |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | как вносить изменения: хуки, формат коммитов, PR |
 | [CHANGELOG.md](CHANGELOG.md) | что изменилось в продукте |
 | [CLAUDE.md](CLAUDE.md) | правила разработки, обязательные к соблюдению |
