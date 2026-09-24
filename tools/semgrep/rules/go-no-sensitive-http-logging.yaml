@@ -43,11 +43,22 @@ rules:
       - pattern: $R.URL.String()
       - pattern: $R.RequestURI
     pattern-sinks:
-      # Функции логирования slog и log, а также создание атрибутов slog:
-      # атрибут с заголовками, собранный заранее, — та же утечка.
+      # Запись в лог: методы логгеров slog и log, функции пакетов slog, log
+      # и fmt. With — тоже сток: атрибут, прикреплённый к логгеру, попадает
+      # в каждую его запись.
       - patterns:
-          - pattern-either:
-              - pattern: $LOG.$METHOD(...)
+          - pattern: $LOG.$METHOD(...)
           - metavariable-regex:
               metavariable: $METHOD
-              regex: ^(Debug|Info|Warn|Error|Log|LogAttrs|DebugContext|InfoContext|WarnContext|ErrorContext|Print|Printf|Println|Fatal|Fatalf|Fatalln|Panic|Panicf|Panicln|Any|String|Group)$
+              regex: ^(Debug|Info|Warn|Error|Log|LogAttrs|DebugContext|InfoContext|WarnContext|ErrorContext|With|Print|Printf|Println|Fatal|Fatalf|Fatalln|Panic|Panicf|Panicln)$
+      # Сборка атрибута или значения slog заранее: атрибут с заголовками,
+      # собранный заранее, — та же утечка. Только функции пакета slog, а не
+      # любой метод с таким именем: String() есть у bytes.Buffer,
+      # strings.Builder и многих других типов, и вызов rec.Body.String()
+      # в сравнении ответа — не запись в лог. Раньше правило ловило его
+      # как утечку (ложное срабатывание на этапе 2, шаг 3).
+      - patterns:
+          - pattern: slog.$ATTR(...)
+          - metavariable-regex:
+              metavariable: $ATTR
+              regex: ^(Any|String|Group|AnyValue|StringValue|GroupValue)$
