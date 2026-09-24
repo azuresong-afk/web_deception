@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +67,9 @@ func testConfig(t *testing.T, upstream string) *config.Config {
 		AdminAddr:       "127.0.0.1:0",
 		ShutdownTimeout: 5 * time.Second,
 		LogLevel:        slog.LevelError,
+		// Свой файл событий у каждого теста: тесты идут параллельно
+		// и не должны писать в один файл.
+		EventsFile: filepath.Join(t.TempDir(), "events.jsonl"),
 	}
 }
 
@@ -140,6 +147,94 @@ func TestRunServesAndShutsDownGracefully(t *testing.T) {
 			_ = resp.Body.Close()
 			t.Errorf("сенсор отвечает на %s после остановки: слушатель не закрыт", u)
 		}
+	}
+}
+
+// TestRunRecordsEventsAndMetrics — путь события целиком: запуск записан,
+// попытка CONNECT записана и посчитана в /metrics, остановка записана,
+// и всё это лежит в файле после остановки.
+func TestRunRecordsEventsAndMetrics(t *testing.T) {
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer app.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := testConfig(t, app.URL)
+	addrs, runErr := startSensor(ctx, t, cfg)
+
+	conn, err := net.DialTimeout("tcp", addrs.Proxy.String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = io.WriteString(conn, "CONNECT 10.0.0.1:22 HTTP/1.1\r\nHost: 10.0.0.1:22\r\n\r\n")
+	reply := make([]byte, 64)
+	n, _ := conn.Read(reply)
+	_ = conn.Close()
+	if !strings.Contains(string(reply[:n]), "405") {
+		t.Errorf("CONNECT получил %q, ожидался 405", reply[:n])
+	}
+
+	code, body := httpGet(t, "http://"+addrs.Admin.String()+"/metrics")
+	for _, want := range []string{
+		"sensor_connect_rejected_total 1\n",
+		"sensor_events_queue_capacity 4096\n",
+		`sensor_upstream_errors_total{class="upstream_unreachable"} 0` + "\n",
+	} {
+		if code != http.StatusOK || !strings.Contains(body, want) {
+			t.Errorf("/metrics (%d) не содержит %q:\n%s", code, want, body)
+		}
+	}
+
+	cancel()
+	select {
+	case err := <-runErr:
+		if err != nil {
+			t.Fatalf("штатная остановка вернула ошибку: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("сенсор не завершился за 15 секунд")
+	}
+
+	data, err := os.ReadFile(cfg.EventsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var types []string
+	for _, line := range lines {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("строка файла событий не разбирается как JSON: %q", line)
+		}
+		types = append(types, ev.Type)
+	}
+	want := []string{"sensor.started", "request.connect_rejected", "sensor.stopping"}
+	if strings.Join(types, ",") != strings.Join(want, ",") {
+		t.Errorf("события в файле: %v, ожидались %v", types, want)
+	}
+}
+
+// TestRunFailsWhenEventsFileUnavailable: файл событий открыть нельзя —
+// сенсор не стартует и не открывает слушатели.
+func TestRunFailsWhenEventsFileUnavailable(t *testing.T) {
+	cfg := testConfig(t, "http://127.0.0.1:1")
+	cfg.EventsFile = filepath.Join(t.TempDir(), "нет-каталога", "events.jsonl")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	listened := false
+	err := run(ctx, cfg, silentLogger(), func(listenAddrs) { listened = true })
+	if err == nil || !strings.Contains(err.Error(), "файл событий") {
+		t.Errorf("ожидалась ошибка о файле событий, получено %v", err)
+	}
+	if listened {
+		t.Error("сенсор открыл слушатели, не открыв файл событий")
 	}
 }
 

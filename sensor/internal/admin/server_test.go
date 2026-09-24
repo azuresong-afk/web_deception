@@ -29,7 +29,7 @@ func call(t *testing.T, ready bool, method, path string) (response, string) {
 	flag.Store(ready)
 
 	rec := httptest.NewRecorder()
-	NewHandler(&flag).ServeHTTP(rec, httptest.NewRequest(method, path, nil))
+	NewHandler(&flag, fakeMetrics).ServeHTTP(rec, httptest.NewRequest(method, path, nil))
 
 	resp := rec.Result()
 	defer func() { _ = resp.Body.Close() }()
@@ -43,6 +43,28 @@ func call(t *testing.T, ready bool, method, path string) (response, string) {
 		t.Fatalf("не удалось прочитать тело ответа: %v", err)
 	}
 	return response{StatusCode: resp.StatusCode, Header: resp.Header}, string(body)
+}
+
+// fakeMetrics изображает обработчик /metrics: сам формат проверяют тесты
+// пакета metrics, здесь — только маршрут.
+var fakeMetrics = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	_, _ = io.WriteString(w, "sensor_up 1\n")
+})
+
+// TestMetricsRoute: /metrics доступен только GET и HEAD, а похожие пути
+// получают 404 — как и остальные служебные пути.
+func TestMetricsRoute(t *testing.T) {
+	t.Parallel()
+
+	if resp, body := call(t, true, http.MethodGet, "/metrics"); resp.StatusCode != http.StatusOK || body != "sensor_up 1\n" {
+		t.Errorf("GET /metrics: %d %q", resp.StatusCode, body)
+	}
+	if resp, _ := call(t, true, http.MethodPost, "/metrics"); resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("POST /metrics: %d, ожидался 405", resp.StatusCode)
+	}
+	if resp, _ := call(t, true, http.MethodGet, "/metrics/"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /metrics/: %d, ожидался 404", resp.StatusCode)
+	}
 }
 
 func TestHealthzAnswersEvenWhenNotReady(t *testing.T) {
@@ -114,7 +136,7 @@ func TestUnknownPathsReturn404(t *testing.T) {
 	// редирект 301 от стандартного маршрутизатора Go и привёл к появлению
 	// обёртки onlyKnownPaths. Тест остаётся как защита от возврата
 	// этого поведения.
-	for _, path := range []string{"/", "/metrics", "/admin", "/healthz/../etc/passwd", "/HEALTHZ", "/healthz/"} {
+	for _, path := range []string{"/", "/metrics/", "/METRICS", "/debug/pprof/", "/admin", "/healthz/../etc/passwd", "/HEALTHZ", "/healthz/"} {
 		t.Run(path, func(t *testing.T) {
 			t.Parallel()
 

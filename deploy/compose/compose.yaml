@@ -72,6 +72,11 @@ services:
       SENSOR_UPSTREAM_URL: http://juice-shop:3000
     ports:
       - "127.0.0.1:8080:8080"
+    # События переживают перезапуск контейнера. У каждого экземпляра
+    # сенсора свой том: два процесса, пишущие и ротирующие один файл,
+    # испортили бы его.
+    volumes:
+      - sensor-juice-events:/var/lib/sensor
     # edge — чтобы опубликовать порт на хост (у изолированной сети нет выхода
     # к хосту); demo-juice — чтобы дотянуться до приложения.
     networks: [edge, demo-juice]
@@ -88,6 +93,8 @@ services:
       SENSOR_UPSTREAM_URL: http://vulnbank:5000
     ports:
       - "127.0.0.1:8081:8080"
+    volumes:
+      - sensor-vulnbank-events:/var/lib/sensor
     networks: [edge, demo-vulnbank]
     depends_on:
       vulnbank:
@@ -281,6 +288,8 @@ networks:
 
 volumes:
   pgdata: {}
+  sensor-juice-events: {}
+  sensor-vulnbank-events: {}
 
 secrets:
   postgres_password:

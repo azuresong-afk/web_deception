@@ -54,6 +54,7 @@ const (
 var allowedPaths = map[string]struct{}{
 	"/healthz": {},
 	"/readyz":  {},
+	"/metrics": {},
 }
 
 // onlyKnownPaths отсекает всё, кроме точного совпадения с известным путём.
@@ -86,7 +87,12 @@ func onlyKnownPaths(next http.Handler) http.Handler {
 // а читают горутины обработчиков запросов. Обычная переменная здесь —
 // гонка данных: без атомарности Go не гарантирует, что читающая горутина
 // вообще когда-нибудь увидит новое значение.
-func NewHandler(ready *atomic.Bool) http.Handler {
+//
+// metrics — обработчик /metrics (пакет metrics). Счётчики сенсора живут
+// на служебном слушателе по той же причине, что и проверки живости:
+// на клиентском порту они выдали бы продукт (угроза T5) и раскрыли бы
+// атакующему, замечены ли его действия.
+func NewHandler(ready *atomic.Bool, metrics http.Handler) http.Handler {
 	mux := http.NewServeMux()
 
 	// Шаблон с методом ("GET /healthz") появился в Go 1.22. Запрос другим
@@ -112,6 +118,10 @@ func NewHandler(ready *atomic.Bool) http.Handler {
 		}
 		respond.Plain(w, http.StatusOK, "ready")
 	})
+
+	// /metrics — счётчики в формате Prometheus: события, потери, отказы
+	// приложения, насыщение соединений.
+	mux.Handle("GET /metrics", metrics)
 
 	return onlyKnownPaths(mux)
 }
