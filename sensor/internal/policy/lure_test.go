@@ -1,6 +1,8 @@
 package policy
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -132,5 +134,47 @@ func TestLuresReject(t *testing.T) {
 				t.Errorf("ошибка %q не содержит %q", err.Error(), tt.want)
 			}
 		})
+	}
+}
+
+// TestMethodOverride: POST с «X-HTTP-Method-Override: DELETE» для ловушки
+// только на DELETE — тоже касание, и такой запрос «непростой».
+func TestMethodOverride(t *testing.T) {
+	t.Parallel()
+
+	trap := &Trap{Methods: []string{http.MethodDelete}, PreflightOnly: true}
+	req := func(method, header, value string) *http.Request {
+		r := httptest.NewRequest(method, "/x", nil)
+		if header != "" {
+			r.Header.Set(header, value)
+		}
+		return r
+	}
+	tests := []struct {
+		name string
+		r    *http.Request
+		want bool
+	}{
+		{"DELETE", req(http.MethodDelete, "", ""), true},
+		{"POST без переопределения", req(http.MethodPost, "", ""), false},
+		{"POST + X-HTTP-Method-Override", req(http.MethodPost, "X-HTTP-Method-Override", "DELETE"), true},
+		{"POST + X-HTTP-Method, нижний регистр", req(http.MethodPost, "X-HTTP-Method", " delete "), true},
+		{"POST + X-Method-Override", req(http.MethodPost, "X-Method-Override", "DELETE"), true},
+		{"POST + другой метод", req(http.MethodPost, "X-HTTP-Method-Override", "PUT"), false},
+		{"GET + переопределение: фреймворки не принимают", req(http.MethodGet, "X-HTTP-Method-Override", "DELETE"), false},
+	}
+	for _, tt := range tests {
+		if got := trap.Accepts(tt.r); got != tt.want {
+			t.Errorf("%s: Accepts = %v, ожидалось %v", tt.name, got, tt.want)
+		}
+	}
+
+	// Заголовок переопределения — нестандартный: с чужого сайта только
+	// через preflight, даже у GET.
+	if !Preflighted(req(http.MethodGet, "X-HTTP-Method-Override", "DELETE")) {
+		t.Error("GET с X-HTTP-Method-Override не признан «непростым»")
+	}
+	if Preflighted(req(http.MethodOptions, "X-HTTP-Method-Override", "DELETE")) {
+		t.Error("OPTIONS признан «непростым»")
 	}
 }

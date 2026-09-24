@@ -28,6 +28,8 @@ const maxSafelistedContentType = 128
 // касание пользователя. Поэтому здесь нет, например, проверки
 // нестандартных заголовков: браузер сам добавляет к запросам заголовки,
 // которых нет в списке «простых», и отличить их надёжно нельзя.
+// Исключение — заголовки переопределения метода (X-HTTP-Method-Override
+// и подобные): браузер их не ставит никогда (ADR-0027).
 //
 // Граница доверия: метод и Content-Type прислал клиент. Они только
 // сравниваются; длина Content-Type ограничена сервером (MaxHeaderBytes)
@@ -43,6 +45,14 @@ func Preflighted(r *http.Request) bool {
 	default:
 		// PUT, DELETE, PATCH и любой другой метод — только через preflight.
 		return true
+	}
+	// Заголовок переопределения метода браузер сам не ставит, а скрипт
+	// с чужого сайта может добавить его только после preflight: это
+	// нестандартный заголовок.
+	for _, h := range methodOverrideHeaders {
+		if r.Header.Get(h) != "" {
+			return true
+		}
 	}
 	values := r.Header.Values("Content-Type")
 	if len(values) == 0 {
@@ -99,6 +109,21 @@ func lowerASCII(s string) string {
 	return strings.Map(func(r rune) rune {
 		if 'A' <= r && r <= 'Z' {
 			return r + ('a' - 'A')
+		}
+		return r
+	}, s)
+}
+
+// methodOverrideHeaders — заголовки, которыми клиент просит приложение
+// считать POST другим методом.
+var methodOverrideHeaders = []string{"X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"}
+
+// upperASCII переводит в верхний регистр только латиницу — по той же
+// причине, что lowerASCII.
+func upperASCII(s string) string {
+	return strings.Map(func(r rune) rune {
+		if 'a' <= r && r <= 'z' {
+			return r - ('a' - 'A')
 		}
 		return r
 	}, s)

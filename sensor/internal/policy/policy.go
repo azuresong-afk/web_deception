@@ -127,10 +127,32 @@ func (t *Trap) LureID() string { return t.lureID }
 // Accepts — выполнены ли условия ловушки для запроса, путь которого уже
 // совпал.
 func (t *Trap) Accepts(r *http.Request) bool {
-	if t.Methods != nil && !slices.Contains(t.Methods, r.Method) {
+	if t.Methods != nil && !t.acceptsMethod(r) {
 		return false
 	}
 	return !t.PreflightOnly || Preflighted(r)
+}
+
+// acceptsMethod — метод запроса в списке ловушки. POST с заголовком
+// переопределения метода («X-HTTP-Method-Override: DELETE») многие
+// фреймворки обрабатывают как указанный метод, поэтому для ловушки
+// это тоже он: иначе атакующий обошёл бы ловушку только для DELETE,
+// отправив POST (ADR-0027).
+func (t *Trap) acceptsMethod(r *http.Request) bool {
+	if slices.Contains(t.Methods, r.Method) {
+		return true
+	}
+	if r.Method != http.MethodPost {
+		// Express, Laravel, Rails и другие принимают переопределение
+		// только у POST.
+		return false
+	}
+	for _, h := range methodOverrideHeaders {
+		if v := r.Header.Get(h); v != "" && slices.Contains(t.Methods, upperASCII(strings.TrimSpace(v))) {
+			return true
+		}
+	}
+	return false
 }
 
 // CookieTrap — cookie-ловушка. Сенсор добавляет к ответам на переходы
