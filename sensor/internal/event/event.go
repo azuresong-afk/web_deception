@@ -129,7 +129,53 @@ type Request struct {
 	HasQuery bool `json:"has_query,omitempty"`
 	// UserAgent — нужен для отпечатка клиента (ADR-0007); обрезан.
 	UserAgent string `json:"user_agent,omitempty"`
+	// Fetch — заголовки Sec-Fetch-*; нет поля — клиент не прислал
+	// ни одного.
+	Fetch *Fetch `json:"sec_fetch,omitempty"`
 }
+
+// Fetch — заголовки Fetch Metadata (Sec-Fetch-*). Их ставит сам браузер,
+// и скрипт на странице изменить их не может. По ним видно, не пришёл ли
+// запрос с чужого сайта — не заставила ли чужая страница браузер
+// пользователя коснуться ловушки (угроза T2, ADR-0026).
+//
+// Инструмент атакующего может прислать любые значения. Поэтому это
+// свидетельство о браузере, а не доказательство: «cross-site» от curl
+// ничего не значит, а вот его отсутствие у современного браузера значит.
+//
+// Записываются только значения из спецификации; любое другое — «other».
+// Строки от клиента в это поле не попадают.
+type Fetch struct {
+	// Site — откуда запрос относительно сайта: cross-site, same-site,
+	// same-origin, none (адрес набран вручную или из закладки).
+	Site string `json:"site,omitempty"`
+	// Mode — режим запроса: navigate (переход по странице), cors, no-cors,
+	// same-origin, websocket.
+	Mode string `json:"mode,omitempty"`
+	// Dest — для чего ресурс: document, image, script, empty (fetch)
+	// и другие.
+	Dest string `json:"dest,omitempty"`
+	// User — переход вызван действием пользователя (клик), а не скриптом.
+	User bool `json:"user,omitempty"`
+}
+
+// fetchOther — значение Sec-Fetch-*, которого нет в спецификации.
+const fetchOther = "other"
+
+// Допустимые значения Sec-Fetch-* по спецификации Fetch Metadata.
+var (
+	fetchSites = map[string]bool{"cross-site": true, "same-origin": true, "same-site": true, "none": true}
+	fetchModes = map[string]bool{
+		"cors": true, "navigate": true, "no-cors": true, "same-origin": true, "websocket": true,
+	}
+	fetchDests = map[string]bool{
+		"audio": true, "audioworklet": true, "document": true, "embed": true, "empty": true,
+		"fencedframe": true, "font": true, "frame": true, "iframe": true, "image": true,
+		"json": true, "manifest": true, "object": true, "paintworklet": true, "report": true,
+		"script": true, "serviceworker": true, "sharedworker": true, "style": true,
+		"track": true, "video": true, "webidentity": true, "worker": true, "xslt": true,
+	}
+)
 
 // New создаёт событие с версией, идентификатором и временем.
 func New(t Type, s Severity) Event {
@@ -161,8 +207,9 @@ func ClientFrom(c forwarded.Client) *Client {
 
 // RequestFrom извлекает из запроса метаданные для события.
 //
-// Функция читает ровно три вещи: метод, путь и User-Agent, и ещё факт
-// наличия параметров. Всё остальное из запроса в событие не попадает.
+// Функция читает ровно это: метод, путь, User-Agent, факт наличия
+// параметров и заголовки Sec-Fetch-* (только значения из спецификации).
+// Всё остальное из запроса в событие не попадает.
 func RequestFrom(r *http.Request) *Request {
 	method, _ := Clean(r.Method, maxMethodBytes)
 	path, truncated := MaskPath(r.URL.EscapedPath())
@@ -173,6 +220,35 @@ func RequestFrom(r *http.Request) *Request {
 		PathTruncated: truncated,
 		HasQuery:      r.URL.RawQuery != "" || r.URL.ForceQuery,
 		UserAgent:     ua,
+		Fetch:         fetchFrom(r.Header),
+	}
+}
+
+// fetchFrom извлекает заголовки Sec-Fetch-*. nil — ни одного нет.
+func fetchFrom(h http.Header) *Fetch {
+	f := Fetch{
+		Site: fetchValue(h.Get("Sec-Fetch-Site"), fetchSites),
+		Mode: fetchValue(h.Get("Sec-Fetch-Mode"), fetchModes),
+		Dest: fetchValue(h.Get("Sec-Fetch-Dest"), fetchDests),
+		// Браузер присылает только «?1»; «?0» он не отправляет вовсе.
+		User: h.Get("Sec-Fetch-User") == "?1",
+	}
+	if f == (Fetch{}) {
+		return nil
+	}
+	return &f
+}
+
+// fetchValue сверяет значение со списком допустимых. Сравнение точное:
+// браузер пишет значения в нижнем регистре, и «Cross-Site» — не браузер.
+func fetchValue(v string, allowed map[string]bool) string {
+	switch {
+	case v == "":
+		return ""
+	case allowed[v]:
+		return v
+	default:
+		return fetchOther
 	}
 }
 

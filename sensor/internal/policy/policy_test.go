@@ -21,12 +21,17 @@ const validPolicy = `{
       "response": {"status": 200, "content_type": "text/plain", "body": "APP_ENV=production\n"}
     },
     {
-      "id": "api-docs",
-      "path": "/internal/api/v2/docs",
+      "id": "api-export",
+      "path": "/internal/api/v2/export",
       "mode": "observe",
       "confidence": "high",
-      "response": {"status": 200, "content_type": "application/json", "body": "{\"methods\":[]}"}
+      "methods": ["POST", "DELETE"],
+      "preflight_only": true,
+      "response": {"status": 200, "content_type": "application/json", "body": "{\"job\":1}"}
     }
+  ],
+  "cookie_traps": [
+    {"id": "role-cookie", "description": "роль в cookie", "name": "user_role", "value": "customer", "confidence": "high"}
   ]
 }`
 
@@ -37,12 +42,29 @@ func TestParseValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("корректная политика отвергнута: %v", err)
 	}
-	if c.Version != "test-1" || c.Len() != 2 {
+	if c.Version != "test-1" || c.Len() != 3 {
 		t.Errorf("версия %q, ловушек %d", c.Version, c.Len())
 	}
 	trap, ok := c.Match("/.env")
 	if !ok || trap.ID != "env-file" || trap.Mode != Enforce || trap.Response.Body != "APP_ENV=production\n" {
 		t.Errorf("ловушка /.env: %+v, найдена %v", trap, ok)
+	}
+	api, ok := c.Match("/internal/api/v2/export")
+	if !ok || !api.PreflightOnly || len(api.Methods) != 2 {
+		t.Errorf("ловушка с условиями: %+v, найдена %v", api, ok)
+	}
+
+	// Атрибуты cookie — от сенсора, а не из политики.
+	ck, ok := c.CookieByName("user_role")
+	if !ok || len(c.Cookies()) != 1 || ck.ID != "role-cookie" || ck.Value != "customer" {
+		t.Fatalf("cookie-ловушка: %+v, найдена %v", ck, ok)
+	}
+	const want = "user_role=customer; Path=/; HttpOnly; SameSite=Strict"
+	if got := ck.SetCookie(false); got != want {
+		t.Errorf("Set-Cookie по HTTP = %q, ожидалось %q", got, want)
+	}
+	if got := ck.SetCookie(true); got != "user_role=customer; Path=/; HttpOnly; Secure; SameSite=Strict" {
+		t.Errorf("Set-Cookie по HTTPS = %q", got)
 	}
 }
 
@@ -58,6 +80,24 @@ func TestParseRejects(t *testing.T) {
 		`"response":{"status":200,"content_type":"text/plain","body":"x"}`
 	withResponse := func(resp string) string {
 		return trap(`"id":"a","path":"/.env","mode":"enforce","confidence":"low","response":` + resp)
+	}
+	// withCookie — политика с одной cookie-ловушкой; fields дописываются
+	// после корректных полей и заменяют их (повторяющийся ключ был бы
+	// ошибкой разбора, поэтому заменяемые поля убираются).
+	withCookie := func(fields string) string {
+		base := map[string]string{"id": `"id":"c"`, "name": `"name":"role"`, "value": `"value":"user"`}
+		for k := range base {
+			if strings.Contains(fields, `"`+k+`":`) {
+				delete(base, k)
+			}
+		}
+		out := fields
+		for _, k := range []string{"id", "name", "value"} {
+			if v, ok := base[k]; ok {
+				out += "," + v
+			}
+		}
+		return `{"schema_version":1,"version":"v1","traps":[],"cookie_traps":[{` + out + `,"confidence":"high"}]}`
 	}
 	withPath := func(p string) string {
 		return trap(`"id":"a","path":"` + p + `","mode":"enforce","confidence":"low",` +
@@ -94,6 +134,17 @@ func TestParseRejects(t *testing.T) {
 		{"неизвестная уверенность", trap(strings.Replace(okTrap, `"low"`, `"certain"`, 1)), ".confidence"},
 		{"длинное описание", trap(okTrap + `,"description":"` + strings.Repeat("a", maxDescriptionLen+1) + `"`), ".description"},
 
+		// Условия и межсайтовые срабатывания (T2).
+		{"high без preflight_only", trap(strings.Replace(okTrap, `"low"`, `"high"`, 1)), "preflight_only"},
+		{"very_high без preflight_only", trap(strings.Replace(okTrap, `"low"`, `"very_high"`, 1) +
+			`,"preflight_only":false`), "preflight_only"},
+		{"пустой список методов", trap(okTrap + `,"methods":[]`), "пустой список"},
+		{"OPTIONS в методах", trap(okTrap + `,"methods":["OPTIONS"]`), ".methods"},
+		{"неизвестный метод", trap(okTrap + `,"methods":["TRACE"]`), ".methods"},
+		{"метод в нижнем регистре", trap(okTrap + `,"methods":["post"]`), ".methods"},
+		{"повтор метода", trap(okTrap + `,"methods":["POST","POST"]`), "повторяется"},
+		{"preflight_only не булево", trap(okTrap + `,"preflight_only":"yes"`), "не разбирается"},
+
 		// Путь.
 		{"корень", withPath("/"), "главную"},
 		{"без косой черты", withPath(".env"), "начинается"},
@@ -112,6 +163,26 @@ func TestParseRejects(t *testing.T) {
 		{"JSON, который не JSON", withResponse(`{"status":200,"content_type":"application/json","body":"{"}`), "не JSON"},
 		{"слишком большое тело", withResponse(`{"status":200,"content_type":"text/plain","body":"` +
 			strings.Repeat("a", maxBodyBytes+1) + `"}`), ".body"},
+
+		// Cookie-ловушка.
+		{"cookie: префикс __Host-", withCookie(`"name":"__Host-role"`), ".name"},
+		{"cookie: пробел в имени", withCookie(`"name":"user role"`), ".name"},
+		{"cookie: нет имени", withCookie(`"name":""`), ".name"},
+		{"cookie: длинное имя", withCookie(`"name":"` + strings.Repeat("a", maxCookieNameLen+1) + `"`), ".name"},
+		{"cookie: ; в значении", withCookie(`"name":"role","value":"a;Domain=evil.example"`), ".value"},
+		{"cookie: кавычки в значении", withCookie(`"name":"role","value":"\"a\""`), ".value"},
+		{"cookie: пустое значение", withCookie(`"name":"role","value":""`), ".value"},
+		{"cookie: длинное значение", withCookie(`"name":"role","value":"` + strings.Repeat("a", maxCookieValueLen+1) + `"`), ".value"},
+		{"cookie: нет уверенности", `{"schema_version":1,"version":"v1","traps":[],"cookie_traps":[` +
+			`{"id":"c","name":"role","value":"user"}]}`, ".confidence"},
+		{"cookie: неизвестное поле", withCookie(`"name":"role","domain":"evil.example"`), "domain"},
+		{"cookie: id занят ловушкой на пути", `{"schema_version":1,"version":"v1","traps":[{` + okTrap + `}],` +
+			`"cookie_traps":[{"id":"a","name":"role","value":"user","confidence":"high"}]}`, "уже есть"},
+		{"cookie: повтор имени", `{"schema_version":1,"version":"v1","traps":[],"cookie_traps":[` +
+			`{"id":"c1","name":"role","value":"user","confidence":"high"},` +
+			`{"id":"c2","name":"role","value":"admin","confidence":"high"}]}`, "уже занята"},
+		{"cookie: слишком много", `{"schema_version":1,"version":"v1","traps":[],"cookie_traps":[` +
+			strings.TrimSuffix(strings.Repeat(`{},`, maxCookieTraps+1), ",") + `]}`, "не больше 8"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -207,7 +278,7 @@ func TestLoadFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, raw, err := LoadFile(good)
-	if err != nil || c.Len() != 2 || string(raw) != validPolicy {
+	if err != nil || c.Len() != 3 || string(raw) != validPolicy {
 		t.Errorf("LoadFile: %v, ловушек %v", err, c)
 	}
 
@@ -288,9 +359,12 @@ func TestDemoPolicyValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("учебная политика не проходит проверку: %v", err)
 	}
-	for _, p := range []string{"/.env", "/.git/config", "/backup.sql"} {
+	for _, p := range []string{"/.env", "/.git/config", "/backup.sql", "/api/internal/v1/users/export"} {
 		if _, ok := c.Match(p); !ok {
 			t.Errorf("в учебной политике нет ловушки %s", p)
 		}
+	}
+	if _, ok := c.CookieByName("account_role"); !ok {
+		t.Error("в учебной политике нет cookie-ловушки account_role")
 	}
 }

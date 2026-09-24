@@ -71,3 +71,18 @@ func Trap(w http.ResponseWriter, status int, contentType, body string) {
 	w.WriteHeader(status)
 	_, _ = io.WriteString(w, body)
 }
+
+// RefusePreflight — ответ на предварительный запрос CORS, который сенсор
+// не одобряет: 204 без единого заголовка Access-Control-Allow-*.
+//
+// Браузер, не получив одобрения, не отправит сам «непростой» запрос с чужого
+// сайта. Отвечает сенсор, а не приложение, потому что приложение может
+// одобрять CORS для всех путей подряд (так делает, например, Juice Shop),
+// и тогда чужая страница всё-таки смогла бы вызвать касание ловушки
+// из браузера пользователя (угроза T2, ADR-0026).
+func RefusePreflight(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}

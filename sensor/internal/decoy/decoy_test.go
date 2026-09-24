@@ -2,9 +2,11 @@ package decoy
 
 import (
 	"bytes"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,7 +103,7 @@ func TestObserveRecordsOnly(t *testing.T) {
 
 	events := &memEvents{}
 	d := New(events, forwarded.NewResolver(nil))
-	d.Swap(mustCompile(t, policyJSON("v1", trapJSON("new-rule", "/admin/backup", "observe", "high", "x"))))
+	d.Swap(mustCompile(t, policyJSON("v1", trapJSON("new-rule", "/admin/backup", "observe", "medium", "x"))))
 
 	rec := httptest.NewRecorder()
 	if d.Inspect(rec, httptest.NewRequest(http.MethodGet, "/admin/backup", nil)) {
@@ -111,7 +113,7 @@ func TestObserveRecordsOnly(t *testing.T) {
 		t.Errorf("в режиме наблюдения что-то записано в ответ: %v", rec.Header())
 	}
 	touches := events.ofType(event.TypeDecoyTouch)
-	if len(touches) != 1 || touches[0].Data["mode"] != "observe" || touches[0].Severity != event.SeverityHigh {
+	if len(touches) != 1 || touches[0].Data["mode"] != "observe" || touches[0].Severity != event.SeverityMedium {
 		t.Errorf("событие касания: %+v", touches)
 	}
 	if d.Stats.Observed.Load() != 1 || d.Stats.Enforced.Load() != 0 {
@@ -276,5 +278,284 @@ func TestCorruptedCacheRejected(t *testing.T) {
 	}
 	if !strings.Contains(h.logs.String(), "копия последней валидной политики тоже неверна") {
 		t.Errorf("в логе нет сообщения: %s", h.logs.String())
+	}
+}
+
+// crossSitePolicy — ловушка, которую нельзя вызвать с чужого сайта,
+// и cookie-ловушка.
+const crossSitePolicy = `{"schema_version":1,"version":"v9","traps":[` +
+	`{"id":"api-export","path":"/api/internal/export","mode":"enforce","confidence":"high",` +
+	`"methods":["POST"],"preflight_only":true,` +
+	`"response":{"status":200,"content_type":"application/json","body":"{\"job\":1}"}},` +
+	`{"id":"env-file","path":"/.env","mode":"enforce","confidence":"low",` +
+	`"response":{"status":200,"content_type":"text/plain","body":"x"}}],` +
+	`"cookie_traps":[{"id":"role-cookie","name":"user_role","value":"customer","confidence":"high"}]}`
+
+func newCrossSite(t *testing.T, trusted ...string) (*Detector, *memEvents) {
+	t.Helper()
+	var prefixes []netip.Prefix
+	for _, p := range trusted {
+		prefixes = append(prefixes, netip.MustParsePrefix(p))
+	}
+	events := &memEvents{}
+	d := New(events, forwarded.NewResolver(prefixes))
+	d.Swap(mustCompile(t, crossSitePolicy))
+	return d, events
+}
+
+// TestPreflightOnlyTrap: ловушка с preflight_only срабатывает только
+// на запрос, который браузер с чужого сайта без preflight не отправил бы.
+// То, что может отправить чужая страница, — не касание (T2).
+func TestPreflightOnlyTrap(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		method, ct  string
+		wantHandled bool
+		wantTouch   bool
+	}{
+		{"GET — не тот метод", http.MethodGet, "", false, false},
+		{"POST формы — может отправить чужая страница", http.MethodPost, "application/x-www-form-urlencoded", false, false},
+		{"POST text/plain — тоже", http.MethodPost, "text/plain", false, false},
+		{"POST JSON — только со своей страницы или не из браузера", http.MethodPost, "application/json", true, true},
+		{"DELETE — не в списке методов", http.MethodDelete, "application/json", false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d, events := newCrossSite(t)
+			r := httptest.NewRequest(tt.method, "/api/internal/export", strings.NewReader(`{}`))
+			if tt.ct != "" {
+				r.Header.Set("Content-Type", tt.ct)
+			}
+			rec := httptest.NewRecorder()
+			if got := d.Inspect(rec, r); got != tt.wantHandled {
+				t.Errorf("handled = %v, ожидалось %v", got, tt.wantHandled)
+			}
+			touches := events.ofType(event.TypeDecoyTouch)
+			if (len(touches) == 1) != tt.wantTouch || len(touches) > 1 {
+				t.Fatalf("касаний %d, ожидалось касание: %v", len(touches), tt.wantTouch)
+			}
+			if tt.wantTouch {
+				ev := touches[0]
+				if ev.Severity != event.SeverityHigh || ev.Data["decoy_kind"] != "path" || ev.Data["decoy_id"] != "api-export" {
+					t.Errorf("событие: %+v", ev)
+				}
+				if rec.Body.String() != `{"job":1}` || rec.Header().Get("Content-Type") != "application/json" {
+					t.Errorf("ответ ловушки: %q %v", rec.Body.String(), rec.Header())
+				}
+			}
+		})
+	}
+}
+
+// TestPreflightRefused: на preflight к ловушке с preflight_only сенсор
+// отвечает сам и не одобряет CORS — даже если приложение одобрило бы
+// любой сайт. Сам preflight — не касание.
+func TestPreflightRefused(t *testing.T) {
+	t.Parallel()
+
+	d, events := newCrossSite(t)
+	r := httptest.NewRequest(http.MethodOptions, "/api/internal/export", nil)
+	r.Header.Set("Origin", "https://evil.example")
+	r.Header.Set("Access-Control-Request-Method", "POST")
+	r.Header.Set("Access-Control-Request-Headers", "content-type")
+	rec := httptest.NewRecorder()
+	if !d.Inspect(rec, r) {
+		t.Fatal("preflight ушёл в приложение")
+	}
+	if rec.Code != http.StatusNoContent || rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("ответ на preflight: %d %v", rec.Code, rec.Header())
+	}
+	if n := len(events.ofType(event.TypeDecoyTouch)); n != 0 {
+		t.Errorf("preflight записан как касание: %d", n)
+	}
+	if d.Stats.PreflightsRefused.Load() != 1 {
+		t.Error("счётчик отказов preflight")
+	}
+
+	// OPTIONS без Access-Control-Request-Method — не preflight: идёт
+	// в приложение, как любой другой запрос.
+	plain := httptest.NewRequest(http.MethodOptions, "/api/internal/export", nil)
+	if d.Inspect(httptest.NewRecorder(), plain) {
+		t.Error("обычный OPTIONS перехвачен")
+	}
+	// Preflight к ловушке без preflight_only — дело приложения.
+	env := httptest.NewRequest(http.MethodOptions, "/.env", nil)
+	env.Header.Set("Access-Control-Request-Method", "GET")
+	rec = httptest.NewRecorder()
+	d.Inspect(rec, env)
+	if rec.Code == http.StatusNoContent {
+		t.Error("preflight к ловушке без preflight_only перехвачен")
+	}
+}
+
+// TestPreflightObserveMode: в режиме наблюдения сенсор не меняет ответы
+// приложения, в том числе на preflight.
+func TestPreflightObserveMode(t *testing.T) {
+	t.Parallel()
+
+	events := &memEvents{}
+	d := New(events, forwarded.NewResolver(nil))
+	d.Swap(mustCompile(t, strings.Replace(crossSitePolicy, `"mode":"enforce","confidence":"high"`,
+		`"mode":"observe","confidence":"high"`, 1)))
+	r := httptest.NewRequest(http.MethodOptions, "/api/internal/export", nil)
+	r.Header.Set("Access-Control-Request-Method", "POST")
+	if d.Inspect(httptest.NewRecorder(), r) {
+		t.Error("в режиме наблюдения сенсор ответил на preflight сам")
+	}
+}
+
+func navigation(path string) *http.Request {
+	r := httptest.NewRequest(http.MethodGet, path, nil)
+	r.Header.Set("Sec-Fetch-Mode", "navigate")
+	r.Header.Set("Sec-Fetch-Dest", "document")
+	return r
+}
+
+// TestCookieBait: наживка выдаётся к ответу на переход по странице, если
+// у браузера её ещё нет, и только к нему.
+func TestCookieBait(t *testing.T) {
+	t.Parallel()
+
+	const plain = "user_role=customer; Path=/; HttpOnly; SameSite=Strict"
+	withHeaders := func(r *http.Request, kv ...string) *http.Request {
+		for i := 0; i < len(kv); i += 2 {
+			r.Header.Set(kv[i], kv[i+1])
+		}
+		return r
+	}
+	tests := []struct {
+		name string
+		r    *http.Request
+		want string
+	}{
+		{"переход без cookie", navigation("/"), plain},
+		{"старый браузер: Accept с text/html", withHeaders(httptest.NewRequest(http.MethodGet, "/", nil),
+			"Accept", "text/html,application/xhtml+xml"), plain},
+		{"cookie уже есть", withHeaders(navigation("/"), "Cookie", "user_role=customer"), ""},
+		{"картинка", withHeaders(httptest.NewRequest(http.MethodGet, "/logo.png", nil),
+			"Sec-Fetch-Mode", "no-cors", "Accept", "text/html"), ""},
+		{"fetch из скрипта", withHeaders(httptest.NewRequest(http.MethodGet, "/api/x", nil),
+			"Sec-Fetch-Mode", "cors"), ""},
+		{"отправка формы", withHeaders(httptest.NewRequest(http.MethodPost, "/login", nil),
+			"Sec-Fetch-Mode", "navigate"), ""},
+		{"curl без Accept", httptest.NewRequest(http.MethodGet, "/", nil), ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			d, events := newCrossSite(t)
+			rec := httptest.NewRecorder()
+			if d.Inspect(rec, tt.r) {
+				t.Fatal("запрос перехвачен")
+			}
+			got := strings.Join(rec.Header().Values("Set-Cookie"), "|")
+			if got != tt.want {
+				t.Errorf("Set-Cookie = %q, ожидалось %q", got, tt.want)
+			}
+			if len(events.ofType(event.TypeDecoyTouch)) != 0 {
+				t.Error("касание без изменённой cookie")
+			}
+		})
+	}
+}
+
+// TestCookieBaitSecure: по HTTPS — с атрибутом Secure; о HTTPS говорит
+// только доверенный прокси, а не клиент.
+func TestCookieBaitSecure(t *testing.T) {
+	t.Parallel()
+
+	d, _ := newCrossSite(t, "10.0.0.0/8")
+	fromProxy := navigation("/")
+	fromProxy.RemoteAddr = "10.0.0.5:4000"
+	fromProxy.Header.Set("X-Forwarded-For", "203.0.113.7")
+	fromProxy.Header.Set("X-Forwarded-Proto", "https")
+	rec := httptest.NewRecorder()
+	d.Inspect(rec, fromProxy)
+	if !strings.Contains(rec.Header().Get("Set-Cookie"), "; Secure") {
+		t.Errorf("по HTTPS от доверенного прокси: %q", rec.Header().Get("Set-Cookie"))
+	}
+
+	fromClient := navigation("/")
+	fromClient.RemoteAddr = "203.0.113.7:5555"
+	fromClient.Header.Set("X-Forwarded-Proto", "https")
+	rec = httptest.NewRecorder()
+	d.Inspect(rec, fromClient)
+	if strings.Contains(rec.Header().Get("Set-Cookie"), "Secure") {
+		t.Errorf("клиент выдал HTTP за HTTPS: %q", rec.Header().Get("Set-Cookie"))
+	}
+}
+
+// TestCookieTouch: изменённое значение — касание; само значение
+// не записывается никуда; наживка заново не выдаётся.
+func TestCookieTouch(t *testing.T) {
+	t.Parallel()
+
+	d, events := newCrossSite(t)
+	r := navigation("/account")
+	r.RemoteAddr = "203.0.113.7:5555"
+	// Две копии изменённой cookie и чужая cookie рядом.
+	r.Header.Set("Cookie", "session=SECRET-SESSION; user_role=admin-SECRET; user_role=root")
+	rec := httptest.NewRecorder()
+	if d.Inspect(rec, r) {
+		t.Fatal("запрос с изменённой cookie перехвачен: ответ должен дать приложение")
+	}
+	if v := rec.Header().Values("Set-Cookie"); len(v) != 0 {
+		t.Errorf("наживка выдана поверх изменённой: %v", v)
+	}
+
+	touches := events.ofType(event.TypeDecoyTouch)
+	if len(touches) != 1 {
+		t.Fatalf("касаний %d, ожидалось одно на ловушку", len(touches))
+	}
+	ev := touches[0]
+	if ev.Severity != event.SeverityHigh || ev.Data["decoy_kind"] != "cookie" || ev.Data["decoy_id"] != "role-cookie" ||
+		ev.Data["policy_version"] != "v9" || ev.Client.IP != "203.0.113.7" {
+		t.Errorf("событие: %+v", ev)
+	}
+	if _, ok := ev.Data["mode"]; ok {
+		t.Error("у cookie-ловушки нет режима: она никогда не отвечает сама")
+	}
+	line, _ := json.Marshal(ev)
+	for _, secret := range []string{"SECRET", "admin", "root", "session"} {
+		if bytes.Contains(line, []byte(secret)) {
+			t.Errorf("в событие попало значение cookie %q: %s", secret, line)
+		}
+	}
+	if d.Stats.CookieTouches.Load() != 1 || d.Stats.CookieBaits.Load() != 0 {
+		t.Errorf("счётчики: касаний %d, наживок %d", d.Stats.CookieTouches.Load(), d.Stats.CookieBaits.Load())
+	}
+}
+
+// TestCookieUnchanged: верное значение и отсутствие cookie — не касание;
+// недопустимое значение библиотека отбрасывает — тоже не касание.
+func TestCookieUnchanged(t *testing.T) {
+	t.Parallel()
+
+	for _, cookie := range []string{"user_role=customer", `user_role="customer"`, "other=1", "user_role=a\x7fb"} {
+		d, events := newCrossSite(t)
+		r := httptest.NewRequest(http.MethodGet, "/api/x", nil)
+		r.Header.Set("Cookie", cookie)
+		d.Inspect(httptest.NewRecorder(), r)
+		if n := len(events.ofType(event.TypeDecoyTouch)); n != 0 {
+			t.Errorf("Cookie: %q — касаний %d", cookie, n)
+		}
+	}
+}
+
+// TestTrapResponseHasNoBait: ответ ловушки — от сенсора, наживка
+// в него не добавляется.
+func TestTrapResponseHasNoBait(t *testing.T) {
+	t.Parallel()
+
+	d, _ := newCrossSite(t)
+	rec := httptest.NewRecorder()
+	if !d.Inspect(rec, navigation("/.env")) {
+		t.Fatal("ловушка не ответила")
+	}
+	if v := rec.Header().Values("Set-Cookie"); len(v) != 0 {
+		t.Errorf("в ответе ловушки наживка: %v", v)
 	}
 }

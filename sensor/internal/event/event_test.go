@@ -28,8 +28,11 @@ func TestFormatV0(t *testing.T) {
 		Type:     TypeConnectRejected,
 		Severity: SeverityLow,
 		Client:   &Client{IP: "203.0.113.7", Peer: "10.0.0.1", ViaTrustedProxy: true},
-		Request:  &Request{Method: "CONNECT", UserAgent: "curl/8.0"},
-		Data:     map[string]string{"target": "internal:22"},
+		Request: &Request{
+			Method: "CONNECT", UserAgent: "curl/8.0",
+			Fetch: &Fetch{Site: "cross-site", Mode: "navigate", Dest: "document", User: true},
+		},
+		Data: map[string]string{"target": "internal:22"},
 	}
 	got, err := json.Marshal(ev)
 	if err != nil {
@@ -37,7 +40,9 @@ func TestFormatV0(t *testing.T) {
 	}
 	want := `{"v":0,"id":"TESTID","ts":"2026-09-24T16:00:00.123Z","type":"request.connect_rejected",` +
 		`"severity":"low","client":{"ip":"203.0.113.7","peer":"10.0.0.1","via_trusted_proxy":true},` +
-		`"request":{"method":"CONNECT","user_agent":"curl/8.0"},"data":{"target":"internal:22"}}`
+		`"request":{"method":"CONNECT","user_agent":"curl/8.0",` +
+		`"sec_fetch":{"site":"cross-site","mode":"navigate","dest":"document","user":true}},` +
+		`"data":{"target":"internal:22"}}`
 	if string(got) != want {
 		t.Errorf("формат события изменился:\nполучено: %s\nожидалось: %s", got, want)
 	}
@@ -101,6 +106,44 @@ func TestRequestFromReadsOnlyMetadata(t *testing.T) {
 		if bytes.Contains(line, []byte(secret)) {
 			t.Errorf("в событие попало %q: %s", secret, line)
 		}
+	}
+}
+
+// TestRequestFromFetch: значения Sec-Fetch-* из спецификации записываются
+// как есть, любые другие — «other», без заголовков поля нет вовсе.
+// Строка от клиента в событие не попадает ни при каком значении.
+func TestRequestFromFetch(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    *Fetch
+	}{
+		{"без заголовков", nil, nil},
+		{"межсайтовая картинка", map[string]string{
+			"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "no-cors", "Sec-Fetch-Dest": "image",
+		}, &Fetch{Site: "cross-site", Mode: "no-cors", Dest: "image"}},
+		{"переход по клику", map[string]string{
+			"Sec-Fetch-Site": "none", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document", "Sec-Fetch-User": "?1",
+		}, &Fetch{Site: "none", Mode: "navigate", Dest: "document", User: true}},
+		{"значения не из спецификации", map[string]string{
+			"Sec-Fetch-Site": "Cross-Site", "Sec-Fetch-Mode": "<script>", "Sec-Fetch-Dest": "evil\nline",
+		}, &Fetch{Site: "other", Mode: "other", Dest: "other"}},
+		{"Sec-Fetch-User не ?1", map[string]string{"Sec-Fetch-User": "?0"}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := httptest.NewRequest(http.MethodGet, "/", nil)
+			for k, v := range tc.headers {
+				r.Header.Set(k, v)
+			}
+			got := RequestFrom(r).Fetch
+			if (got == nil) != (tc.want == nil) || (got != nil && *got != *tc.want) {
+				t.Errorf("Fetch = %+v, ожидалось %+v", got, tc.want)
+			}
+		})
 	}
 }
 

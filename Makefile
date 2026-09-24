@@ -327,13 +327,30 @@ smoke-events:
 	@echo "==> попытка CONNECT записана в файл событий"
 	@curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/.env | grep -q '^APP_ENV='
 	@curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8081/.git/config | grep -q '^\[core\]'
+	@# Ловушка №8 отвечает на POST с JSON (ADR-0026).
+	@curl --fail --silent --show-error --max-time 5 --request POST --header 'Content-Type: application/json' \
+		--data '{}' http://127.0.0.1:8080/api/internal/v1/users/export | grep -q '"status":"queued"'
+	@# Preflight к ней с чужого сайта: Juice Shop одобрил бы CORS для любого
+	@# сайта, но отвечает сенсор — 204 без Access-Control-Allow-Origin.
+	@hdrs=$$(curl --silent --show-error --include --max-time 5 --request OPTIONS \
+		--header 'Origin: https://evil.example' --header 'Access-Control-Request-Method: POST' \
+		http://127.0.0.1:8080/api/internal/v1/users/export) && \
+		echo "$$hdrs" | grep -q '^HTTP/1.1 204' && \
+		! echo "$$hdrs" | grep -qi '^access-control-allow-origin'
+	@# Cookie-наживка №9 — к ответу на переход по странице, у обеих целей.
+	@for port in 8080 8081; do \
+		hdrs=$$(curl --silent --show-error --max-time 5 --header 'Sec-Fetch-Mode: navigate' \
+			--dump-header - --output /dev/null http://127.0.0.1:$$port/) && \
+		echo "$$hdrs" | grep -qi '^set-cookie: account_role=customer; Path=/; HttpOnly; SameSite=Strict' \
+			|| { echo "нет cookie-наживки на порту $$port"; exit 1; }; \
+	done
 	@for i in 1 2 3 4 5; do \
-		$(COMPOSE) --profile demo cp sensor-juice:/var/lib/sensor/events.jsonl - 2>/dev/null \
-			| tar -xO | grep -q '"decoy_id":"env-file"' && break; \
+		ev=$$($(COMPOSE) --profile demo cp sensor-juice:/var/lib/sensor/events.jsonl - 2>/dev/null | tar -xO); \
+		echo "$$ev" | grep -q '"decoy_id":"env-file"' && echo "$$ev" | grep -q '"decoy_id":"api-export"' && break; \
 		if [ "$$i" -eq 5 ]; then echo "касание ловушки не появилось в файле событий"; exit 1; fi; \
 		sleep 1; \
 	done
-	@echo "==> ловушки отвечают вместо приложений, касание записано"
+	@echo "==> ловушки отвечают вместо приложений, касание записано, preflight не одобрен, наживка выдана"
 
 dev: secrets ## Поднять control plane, PostgreSQL и NATS и дождаться готовности
 	VERSION=$(VERSION) $(COMPOSE) up --build --detach --wait

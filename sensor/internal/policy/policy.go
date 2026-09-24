@@ -2,10 +2,13 @@
 // нормализация пути для сравнения с ловушками, загрузка из файла.
 //
 // Политика — данные, а не код (ADR-0018): сенсор понимает фиксированный
-// набор конструкций, и администратор меняет их параметры. На шаге 8
-// конструкция одна — ловушка на пути: запрос к этому пути — касание,
-// а сенсор отвечает вместо приложения заданным ответом или только
-// записывает касание (режим наблюдения).
+// набор конструкций, и администратор меняет их параметры. Конструкций две:
+//   - ловушка на пути (шаг 8, ADR-0025): запрос к этому пути — касание,
+//     а сенсор отвечает вместо приложения заданным ответом или только
+//     записывает касание (режим наблюдения). С шага 9 у неё есть условия:
+//     методы и «только запросы с preflight» (ADR-0026);
+//   - cookie-ловушка (шаг 9, ADR-0026): сенсор выдаёт браузеру cookie
+//     с заданным значением, и запрос с изменённым значением — касание.
 //
 // Граница доверия: политику пишет администратор, а с этапа 3 — control
 // plane, который может быть взломан (угроза T15). Поэтому сенсор проверяет
@@ -18,8 +21,10 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"net/http"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -42,6 +47,11 @@ const (
 	maxDescriptionLen = 256
 	maxPathLen        = 256
 	maxBodyBytes      = 64 << 10 // 64 КиБ
+	// Cookie-ловушек немного: каждая — ещё один Set-Cookie в ответах
+	// на переходы по страницам и ещё одна cookie в браузере пользователя.
+	maxCookieTraps    = 8
+	maxCookieNameLen  = 64
+	maxCookieValueLen = 64
 	// Сколько ошибок проверки перечислять. Остальные не нужны, чтобы
 	// понять, что политика неверна, и раздули бы сообщение.
 	maxReportedErrors = 20
@@ -76,6 +86,8 @@ type Policy struct {
 	// чтобы по касанию было видно, какая политика сработала.
 	Version string `json:"version"`
 	Traps   []Trap `json:"traps"`
+	// CookieTraps — необязательно.
+	CookieTraps []CookieTrap `json:"cookie_traps"`
 }
 
 // Trap — ловушка на пути.
@@ -87,6 +99,54 @@ type Trap struct {
 	Mode        Mode       `json:"mode"`
 	Confidence  Confidence `json:"confidence"`
 	Response    Response   `json:"response"`
+
+	// Methods — при каких методах запрос к пути — касание. Необязательно:
+	// без поля — при любом.
+	Methods []string `json:"methods"`
+	// PreflightOnly — касание, только если браузер не отправил бы такой
+	// запрос с чужого сайта без предварительного запроса CORS (preflight).
+	// Такую ловушку чужая страница не может заставить сработать в браузере
+	// пользователя (угроза T2, ADR-0026). Обязательно для уверенности
+	// high и very_high.
+	PreflightOnly bool `json:"preflight_only"`
+}
+
+// Accepts — выполнены ли условия ловушки для запроса, путь которого уже
+// совпал.
+func (t *Trap) Accepts(r *http.Request) bool {
+	if t.Methods != nil && !slices.Contains(t.Methods, r.Method) {
+		return false
+	}
+	return !t.PreflightOnly || Preflighted(r)
+}
+
+// CookieTrap — cookie-ловушка. Сенсор добавляет к ответам на переходы
+// по страницам Set-Cookie с Name=Value (наживка); запрос, в котором cookie
+// Name есть, но значение другое, — касание: кто-то изменил её вручную.
+//
+// SameSite=Strict: с чужого сайта браузер её не отправит вовсе, поэтому
+// чужая страница не может вызвать касание (T2). HttpOnly: скрипт на странице
+// её не перезапишет.
+type CookieTrap struct {
+	ID          string     `json:"id"`
+	Description string     `json:"description"`
+	Name        string     `json:"name"`
+	Value       string     `json:"value"`
+	Confidence  Confidence `json:"confidence"`
+
+	// Готовые заголовки Set-Cookie: собираются один раз при разборе
+	// политики, а не на каждом запросе.
+	setCookie, setCookieSecure string
+}
+
+// SetCookie — значение заголовка Set-Cookie. secure — запрос пришёл
+// по HTTPS: тогда cookie с атрибутом Secure, и браузер не отправит её
+// по HTTP (и сканеры сайта клиента не отметят её как небезопасную).
+func (c *CookieTrap) SetCookie(secure bool) string {
+	if secure {
+		return c.setCookieSecure
+	}
+	return c.setCookie
 }
 
 // Response — ответ ловушки в режиме enforce.
@@ -103,7 +163,21 @@ var (
 	// пути по RFC 3986, кроме «;» (параметры сегмента) и «%» (путь записан
 	// уже раскодированным).
 	pathRe = regexp.MustCompile(`^/[A-Za-z0-9._~!$&'()*+,=:@/-]*$`)
+	// Имя cookie начинается с буквы или цифры: так исключены префиксы
+	// «__Host-» и «__Secure-». Браузер принимает такие cookie только
+	// с Secure, а по HTTP сенсор Secure не ставит — наживка молча
+	// не доходила бы до браузера.
+	cookieNameRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
+	cookieValueRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 )
+
+// Методы, которые можно указать в условии ловушки. OPTIONS нет намеренно:
+// предварительный запрос CORS браузер отправляет сам, с любого сайта,
+// и ловушка на OPTIONS срабатывала бы от чужой страницы (T2).
+var allowedMethods = map[string]bool{
+	http.MethodGet: true, http.MethodHead: true, http.MethodPost: true,
+	http.MethodPut: true, http.MethodDelete: true, http.MethodPatch: true,
+}
 
 // Коды ответа ловушки. Без перенаправлений: 3xx с адресом из политики —
 // это готовый открытый редирект на сайте клиента.
@@ -114,15 +188,27 @@ var allowedStatus = map[int]bool{200: true, 401: true, 403: true, 404: true, 500
 type Compiled struct {
 	Version string
 	traps   map[string]*Trap
+	cookies []*CookieTrap
+	// cookieByName — те же cookie-ловушки по имени cookie.
+	cookieByName map[string]*CookieTrap
 }
 
 // Empty — политика без ловушек: обнаружения нет.
 func Empty() *Compiled {
-	return &Compiled{traps: map[string]*Trap{}}
+	return &Compiled{traps: map[string]*Trap{}, cookieByName: map[string]*CookieTrap{}}
 }
 
-// Len — число ловушек.
-func (c *Compiled) Len() int { return len(c.traps) }
+// Len — число ловушек всех видов.
+func (c *Compiled) Len() int { return len(c.traps) + len(c.cookies) }
+
+// Cookies — cookie-ловушки в порядке политики.
+func (c *Compiled) Cookies() []*CookieTrap { return c.cookies }
+
+// CookieByName — cookie-ловушка с таким именем cookie.
+func (c *Compiled) CookieByName(name string) (*CookieTrap, bool) {
+	t, ok := c.cookieByName[name]
+	return t, ok
+}
 
 // Match ищет ловушку для пути запроса. requestPath — r.URL.Path,
 // уже раскодированный из процентной записи.
@@ -148,10 +234,30 @@ func Parse(data []byte) (*Compiled, error) {
 	if err := validate(&p); err != nil {
 		return nil, err
 	}
-	c := &Compiled{Version: p.Version, traps: make(map[string]*Trap, len(p.Traps))}
+	c := &Compiled{
+		Version:      p.Version,
+		traps:        make(map[string]*Trap, len(p.Traps)),
+		cookieByName: make(map[string]*CookieTrap, len(p.CookieTraps)),
+	}
 	for i := range p.Traps {
 		t := p.Traps[i]
 		c.traps[t.Path] = &t
+	}
+	for i := range p.CookieTraps {
+		t := p.CookieTraps[i]
+		// Атрибуты — не из политики, а отсюда, для любой cookie-ловушки.
+		// Path=/ — cookie видна на всём сайте; Domain нет — только этот хост,
+		// не поддомены. Срок не задан: cookie живёт до закрытия браузера
+		// и выдаётся снова при следующем переходе.
+		ck := &http.Cookie{
+			Name: t.Name, Value: t.Value, Path: "/",
+			HttpOnly: true, SameSite: http.SameSiteStrictMode,
+		}
+		t.setCookie = ck.String()
+		ck.Secure = true
+		t.setCookieSecure = ck.String()
+		c.cookies = append(c.cookies, &t)
+		c.cookieByName[t.Name] = &t
 	}
 	return c, nil
 }
@@ -175,7 +281,12 @@ func validate(p *Policy) error {
 	if len(p.Traps) > maxTraps {
 		add("traps: не больше %d ловушек, получено %d", maxTraps, len(p.Traps))
 	}
+	if len(p.CookieTraps) > maxCookieTraps {
+		add("cookie_traps: не больше %d cookie-ловушек, получено %d", maxCookieTraps, len(p.CookieTraps))
+	}
 
+	// Идентификаторы общие для ловушек всех видов: по decoy_id в событии
+	// должно быть однозначно видно, что трогали.
 	ids := map[string]bool{}
 	paths := map[string]bool{}
 	for i := range p.Traps {
@@ -211,6 +322,28 @@ func validate(p *Policy) error {
 		default:
 			add("%s.confidence: обязательна, low, medium, high или very_high", at)
 		}
+		if (t.Confidence == High || t.Confidence == VeryHigh) && !t.PreflightOnly {
+			// Правило модели угроз (T2): касание высокой уверенности
+			// не должно вызываться чужой страницей из браузера пользователя.
+			add("%s.confidence: %s — только с preflight_only: true, иначе касание "+
+				"может вызвать чужая страница из браузера пользователя (T2)", at, t.Confidence)
+		}
+
+		if t.Methods != nil {
+			if len(t.Methods) == 0 {
+				add("%s.methods: пустой список; уберите поле, чтобы ловушка срабатывала при любом методе", at)
+			}
+			seen := map[string]bool{}
+			for _, m := range t.Methods {
+				switch {
+				case !allowedMethods[m]:
+					add("%s.methods: %q — допустимы GET, HEAD, POST, PUT, DELETE, PATCH", at, m)
+				case seen[m]:
+					add("%s.methods: %q повторяется", at, m)
+				}
+				seen[m] = true
+			}
+		}
 
 		r := &t.Response
 		if !allowedStatus[r.Status] {
@@ -227,6 +360,41 @@ func validate(p *Policy) error {
 		}
 		if r.ContentType == "application/json" && !jsontext.Value(r.Body).IsValid() {
 			add("%s.response.body: объявлен application/json, но это не JSON", at)
+		}
+	}
+
+	names := map[string]bool{}
+	for i := range p.CookieTraps {
+		if i >= maxCookieTraps {
+			break
+		}
+		t := &p.CookieTraps[i]
+		at := "cookie_traps[" + strconv.Itoa(i) + "]"
+
+		if len(t.ID) > maxIDLen || !idRe.MatchString(t.ID) {
+			add("%s.id: обязателен, до %d символов из a-z 0-9 -, начинается с буквы или цифры", at, maxIDLen)
+		} else if ids[t.ID] {
+			add("%s.id: %q уже есть", at, t.ID)
+		}
+		ids[t.ID] = true
+
+		if len(t.Description) > maxDescriptionLen {
+			add("%s.description: не длиннее %d байт", at, maxDescriptionLen)
+		}
+		if len(t.Name) > maxCookieNameLen || !cookieNameRe.MatchString(t.Name) {
+			add("%s.name: обязательно, до %d символов из A-Z a-z 0-9 _ . -, начинается с буквы или цифры",
+				at, maxCookieNameLen)
+		} else if names[t.Name] {
+			add("%s.name: cookie %q уже занята другой ловушкой", at, t.Name)
+		}
+		names[t.Name] = true
+		if len(t.Value) > maxCookieValueLen || !cookieValueRe.MatchString(t.Value) {
+			add("%s.value: обязательно, до %d символов из A-Z a-z 0-9 _ . -", at, maxCookieValueLen)
+		}
+		switch t.Confidence {
+		case Low, Medium, High, VeryHigh:
+		default:
+			add("%s.confidence: обязательна, low, medium, high или very_high", at)
 		}
 	}
 	return errors.Join(errs...)
