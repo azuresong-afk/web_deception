@@ -32,7 +32,8 @@ type Stats struct {
 	Enforced atomic.Uint64
 	// Observed — касания в режиме наблюдения: запрос ушёл в приложение.
 	Observed atomic.Uint64
-	// CookieTouches — запросы с изменённой cookie-наживкой.
+	// CookieTouches — запросы с изменённой cookie-наживкой. Все, а не только
+	// записанные событием: события прорежены (recent.go).
 	CookieTouches atomic.Uint64
 	// CookieBaits — сколько раз сенсор выдал cookie-наживку.
 	CookieBaits atomic.Uint64
@@ -49,13 +50,15 @@ type Detector struct {
 	current atomic.Pointer[policy.Compiled]
 	events  event.Emitter
 	trust   *forwarded.Resolver
+	// recent прореживает события о касаниях cookie-ловушек (recent.go).
+	recent *recentTouches
 
 	Stats Stats
 }
 
 // New создаёт Detector без ловушек.
 func New(events event.Emitter, trust *forwarded.Resolver) *Detector {
-	d := &Detector{events: events, trust: trust}
+	d := &Detector{events: events, trust: trust, recent: newRecentTouches()}
 	d.current.Store(policy.Empty())
 	return d
 }
@@ -109,8 +112,13 @@ func (d *Detector) Inspect(w http.ResponseWriter, r *http.Request) bool {
 
 // touch записывает касание ловушки. Ключи data — константы из кода.
 func (d *Detector) touch(r *http.Request, p *policy.Compiled, id string, sev event.Severity, data map[string]string) {
+	d.emitTouch(r, event.ClientFrom(d.trust.Resolve(r)), p, id, sev, data)
+}
+
+func (d *Detector) emitTouch(r *http.Request, client *event.Client, p *policy.Compiled, id string,
+	sev event.Severity, data map[string]string) {
 	ev := event.New(event.TypeDecoyTouch, sev)
-	ev.Client = event.ClientFrom(d.trust.Resolve(r))
+	ev.Client = client
 	ev.Request = event.RequestFrom(r)
 	data["decoy_id"] = id
 	data["policy_version"] = p.Version
@@ -144,9 +152,13 @@ func (d *Detector) checkCookies(p *policy.Compiled, r *http.Request) map[string]
 			}
 			touched[trap.Name] = true
 			d.Stats.CookieTouches.Add(1)
+			client := event.ClientFrom(d.trust.Resolve(r))
+			if !d.recent.first(client.IP, trap.ID) {
+				continue
+			}
 			// Изменённое значение не записывается: это cookie, а значит,
 			// в ней может оказаться что угодно, вплоть до чужого токена.
-			d.touch(r, p, trap.ID, severity(trap.Confidence), map[string]string{
+			d.emitTouch(r, client, p, trap.ID, severity(trap.Confidence), map[string]string{
 				"decoy_kind": "cookie",
 				"confidence": string(trap.Confidence),
 			})
