@@ -273,3 +273,24 @@ func FuzzNormalizePath(f *testing.F) {
 		}
 	})
 }
+
+// TestDemoPolicyValid: учебная политика из репозитория проходит ту же
+// проверку, что и в сенсоре. Иначе опечатка в ней обнаружилась бы только
+// на стенде — как отказ политики и сенсор без ловушек.
+func TestDemoPolicyValid(t *testing.T) {
+	t.Parallel()
+
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "deploy", "policy", "demo.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(data)
+	if err != nil {
+		t.Fatalf("учебная политика не проходит проверку: %v", err)
+	}
+	for _, p := range []string{"/.env", "/.git/config", "/backup.sql"} {
+		if _, ok := c.Match(p); !ok {
+			t.Errorf("в учебной политике нет ловушки %s", p)
+		}
+	}
+}

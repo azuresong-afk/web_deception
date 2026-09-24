@@ -59,7 +59,7 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
         security security-secrets security-go security-py security-sast \
         security-containers security-dockerfiles security-images \
         test test-go test-py test-scripts test-hooks hooks \
-        build run-sensor run-cp clean secrets images check-images smoke smoke-events dev dev-demo dev-vulnbank dev-events \
+        build run-sensor run-cp clean secrets images check-images smoke smoke-events dev dev-demo dev-vulnbank dev-events policy-reload \
         dev-ps dev-logs dev-down dev-reset vulnbank-requirements
 
 help: ## Показать список доступных команд
@@ -163,11 +163,16 @@ SENSOR_UPSTREAM_URL ?= http://127.0.0.1:3000
 # в образе; при запуске на машине разработчика события пишутся сюда.
 # Каталог в .gitignore: в событиях адреса клиентов.
 SENSOR_EVENTS_FILE ?= $(CURDIR)/.run/events.jsonl
+# Политика для make run-sensor — учебная, та же, что в демо-стенде;
+# копия последней валидной — рядом с событиями.
+SENSOR_POLICY_FILE ?= $(CURDIR)/deploy/policy/demo.json
+SENSOR_POLICY_CACHE_FILE ?= $(CURDIR)/.run/policy.last-valid.json
 
 run-sensor: ## Запустить сенсор: 127.0.0.1:8080 → SENSOR_UPSTREAM_URL, служебный 127.0.0.1:9090, события в .run/
 	@mkdir -p -m 700 "$(dir $(SENSOR_EVENTS_FILE))"
 	cd $(SENSOR_DIR) && SENSOR_LISTEN_ADDR=127.0.0.1:8080 SENSOR_UPSTREAM_URL=$(SENSOR_UPSTREAM_URL) \
-		SENSOR_EVENTS_FILE=$(SENSOR_EVENTS_FILE) $(GO) run ./cmd/sensor
+		SENSOR_EVENTS_FILE=$(SENSOR_EVENTS_FILE) SENSOR_POLICY_FILE=$(SENSOR_POLICY_FILE) \
+		SENSOR_POLICY_CACHE_FILE=$(SENSOR_POLICY_CACHE_FILE) $(GO) run ./cmd/sensor
 
 run-cp: ## Запустить control plane на 127.0.0.1:8000
 	cd $(CP_DIR) && PYTHONPATH=src $(UV) run python -m webdeception_cp
@@ -295,6 +300,14 @@ smoke: ## Поднять стек с обеими учебными целями 
 	$(MAKE) check-images
 	$(MAKE) dev-reset
 
+policy-reload: ## Перечитать политику в запущенных сенсорах после правки deploy/policy/demo.json
+	@for svc in sensor-juice sensor-vulnbank; do \
+		if [ -n "$$($(COMPOSE) $(ALL_PROFILES) ps --quiet $$svc)" ]; then \
+			$(COMPOSE) $(ALL_PROFILES) kill --signal SIGHUP $$svc; \
+		fi; \
+	done
+	@echo "==> сенсоры перечитали политику; результат — в make dev-events (sensor.policy_loaded или sensor.policy_rejected)"
+
 dev-events: ## Показать файл событий сенсора перед Juice Shop (make dev-demo)
 	@$(COMPOSE) --profile demo cp sensor-juice:/var/lib/sensor/events.jsonl - 2>/dev/null | tar -xO
 
@@ -312,6 +325,15 @@ smoke-events:
 		sleep 1; \
 	done
 	@echo "==> попытка CONNECT записана в файл событий"
+	@curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8080/.env | grep -q '^APP_ENV='
+	@curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8081/.git/config | grep -q '^\[core\]'
+	@for i in 1 2 3 4 5; do \
+		$(COMPOSE) --profile demo cp sensor-juice:/var/lib/sensor/events.jsonl - 2>/dev/null \
+			| tar -xO | grep -q '"decoy_id":"env-file"' && break; \
+		if [ "$$i" -eq 5 ]; then echo "касание ловушки не появилось в файле событий"; exit 1; fi; \
+		sleep 1; \
+	done
+	@echo "==> ловушки отвечают вместо приложений, касание записано"
 
 dev: secrets ## Поднять control plane, PostgreSQL и NATS и дождаться готовности
 	VERSION=$(VERSION) $(COMPOSE) up --build --detach --wait

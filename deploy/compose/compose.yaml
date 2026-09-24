@@ -70,13 +70,22 @@ services:
       SENSOR_LISTEN_ADDR: 0.0.0.0:8080
       # Адрес приложения — только отсюда, никогда из запроса (угроза T17).
       SENSOR_UPSTREAM_URL: http://juice-shop:3000
+      # Учебная политика: три ловушки (ADR-0025). Перечитать после правки —
+      # make policy-reload.
+      SENSOR_POLICY_FILE: /etc/sensor/policy/demo.json
     ports:
       - "127.0.0.1:8080:8080"
-    # События переживают перезапуск контейнера. У каждого экземпляра
-    # сенсора свой том: два процесса, пишущие и ротирующие один файл,
-    # испортили бы его.
+    # События и копия последней валидной политики переживают перезапуск
+    # контейнера. У каждого экземпляра сенсора свой том: два процесса,
+    # пишущие и ротирующие один файл, испортили бы его.
+    #
+    # Политика — каталог, а не один файл, и только для чтения. Редакторы
+    # и sed -i сохраняют файл через замену на новый, а смонтированный
+    # по отдельности файл остался бы в контейнере старым: сенсор по SIGHUP
+    # перечитывал бы прежнюю политику. Каталог такую замену видит.
     volumes:
       - sensor-juice-events:/var/lib/sensor
+      - ../policy:/etc/sensor/policy:ro
     # edge — чтобы опубликовать порт на хост (у изолированной сети нет выхода
     # к хосту); demo-juice — чтобы дотянуться до приложения.
     networks: [edge, demo-juice]
@@ -91,10 +100,12 @@ services:
       SENSOR_LOG_LEVEL: info
       SENSOR_LISTEN_ADDR: 0.0.0.0:8080
       SENSOR_UPSTREAM_URL: http://vulnbank:5000
+      SENSOR_POLICY_FILE: /etc/sensor/policy/demo.json
     ports:
       - "127.0.0.1:8081:8080"
     volumes:
       - sensor-vulnbank-events:/var/lib/sensor
+      - ../policy:/etc/sensor/policy:ro
     networks: [edge, demo-vulnbank]
     depends_on:
       vulnbank:
