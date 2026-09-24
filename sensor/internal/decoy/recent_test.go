@@ -62,8 +62,10 @@ func TestRecentTouchesUnknownClient(t *testing.T) {
 	t.Parallel()
 
 	r := newRecentTouches()
-	if !r.first("", "c") || !r.first("", "c") {
-		t.Error("касания клиента без адреса прорежены")
+	for i := range 2 {
+		if !r.first("", "c") {
+			t.Errorf("касание %d клиента без адреса прорежено", i+1)
+		}
 	}
 }
 
