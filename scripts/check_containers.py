@@ -25,6 +25,12 @@
     D3  финальная стадия переключается на пользователя с числовым UID, не 0
     D4  директива "# syntax=" либо отсутствует, либо закреплена по digest
     D5  нет ADD с загрузкой по URL: такой файл не проверяется ничем
+    D6  финальная стадия построена на distroless: в образе продукта нет shell,
+        менеджера пакетов и утилит (ADR-0020)
+
+Каталог deploy/docker — только образы продукта, поэтому D6 действует на все
+Dockerfile в нём. Учебные цели (ADR-0019) — намеренно уязвимые приложения
+со своим стеком — живут отдельно и под D6 не попадают.
 
 Только стандартная библиотека Python: у проверки безопасности не должно
 быть собственной цепочки поставки.
@@ -52,6 +58,9 @@ COMPOSE_FILES = (COMPOSE_FILE, SCANNERS_COMPOSE_FILE)
 DOCKERFILES_DIR = ROOT / "deploy" / "docker"
 
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+# Префикс, а не список конкретных образов: distroless бывает static, cc,
+# python3 и другие, и любой из них удовлетворяет правилу.
+_DISTROLESS_PREFIX = "gcr.io/distroless/"
 _ROOT_USERS = frozenset({"", "0", "root"})
 _LOCAL_HOST_IPS = frozenset({"127.0.0.1", "::1"})
 
@@ -155,14 +164,19 @@ def check_dockerfile(where: str, text: str) -> list[Violation]:
                 Violation(where, "D4", f"директива syntax {directive!r} не закреплена по digest")
             )
 
-    stages: set[str] = set()
+    # Имя стадии → базовый образ, от которого она в итоге построена.
+    # Нужно для D6: финальная стадия может начинаться с FROM другой стадии,
+    # и тогда смотреть надо на образ, с которого началась та.
+    stages: dict[str, str] = {}
     final_user: str | None = None
+    final_base = ""
 
     for instruction, args in _instructions(text):
         if instruction == "FROM":
             final_user = None  # USER действует только внутри своей стадии
             image, alias = _parse_from(args)
             is_stage_reference = image.lower() in stages or image == "scratch"
+            final_base = stages.get(image.lower(), image)
             if not is_stage_reference and not _DIGEST.search(image):
                 out.append(
                     Violation(where, "D1", f"базовый образ {image!r} не закреплён по digest")
@@ -170,7 +184,7 @@ def check_dockerfile(where: str, text: str) -> list[Violation]:
             if _has_latest_tag(image):
                 out.append(Violation(where, "D2", f"базовый образ {image!r} использует тег latest"))
             if alias:
-                stages.add(alias.lower())
+                stages[alias.lower()] = final_base
 
         elif instruction == "USER":
             final_user = args.strip()
@@ -179,6 +193,30 @@ def check_dockerfile(where: str, text: str) -> list[Violation]:
             out.append(
                 Violation(where, "D5", "ADD с загрузкой по URL: содержимое ничем не проверяется")
             )
+
+    # D6. scratch тоже без shell, но в нём нет и сертификатов, и пользователя
+    # nonroot — ради единообразия требуем именно distroless.
+    if final_base and not final_base.startswith(_DISTROLESS_PREFIX):
+        out.append(
+            Violation(
+                where,
+                "D6",
+                f"финальная стадия построена на {final_base!r}, а не на distroless: "
+                "в образе останутся shell и менеджер пакетов",
+            )
+        )
+    # Отладочные варианты distroless (теги debug, debug-nonroot) содержат
+    # busybox с shell в /busybox/sh. Они для локальной отладки, не для образа
+    # продукта: формально distroless, по сути — снова образ с shell.
+    elif _is_distroless_debug(final_base):
+        out.append(
+            Violation(
+                where,
+                "D6",
+                f"финальная стадия построена на отладочном варианте {final_base!r}: "
+                "в нём есть shell (/busybox/sh)",
+            )
+        )
 
     # D3.
     if final_user is None:
@@ -225,6 +263,13 @@ def _parse_from(args: str) -> tuple[str, str | None]:
     image = tokens[0] if tokens else ""
     alias = tokens[2] if len(tokens) >= 3 and tokens[1].upper() == "AS" else None
     return image, alias
+
+
+def _is_distroless_debug(image: str) -> bool:
+    name = image.split("@", 1)[0]
+    last_segment = name.rsplit("/", 1)[-1]
+    _, _, tag = last_segment.partition(":")
+    return tag.startswith("debug")
 
 
 def _has_latest_tag(image: str) -> bool:
