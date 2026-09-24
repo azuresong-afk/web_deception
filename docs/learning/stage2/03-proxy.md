@@ -3,6 +3,12 @@
 > Снимок на момент шага: 2026-09-24. Решение — в
 > [ADR-0021](../../adr/0021-proxy-transparency.md). Текущее состояние —
 > в [guide.md](../../guide.md), раздел «Сенсор».
+>
+> **Поправка с шага 5.** Здесь сказано, что ReverseProxy удаляет «все
+> `X-Forwarded-*`». Это неверно: он удаляет только `X-Forwarded-For`, `-Host`,
+> `-Proto` и `Forwarded`, а `X-Forwarded-Port`, `-Prefix`, `-Ssl` доходили
+> до приложения от клиента. Исправлено на шаге 5 — разбор
+> [05-client-ip.md](05-client-ip.md), [ADR-0022](../../adr/0022-client-ip-trusted-proxies.md).
 
 ## Что и зачем
 

@@ -5,19 +5,29 @@
 # подставляет в X-Forwarded-For чужой IP, и мы блокируем легитимного
 # пользователя или партнёра вместо атакующего.
 #
-# На этапе 2 появится модуль доверенных прокси — единственное место, где
-# такие заголовки читать можно; он будет исключён из этого правила явно.
+# Единственное место, где такие заголовки читать можно, — пакет
+# sensor/internal/forwarded: он проверяет, что соединение пришло
+# от доверенного прокси (ADR-0022). Он исключён из правила явно, ниже.
+#
+# Имена: все X-Forwarded-* (не только For: Proto, Host, Port, Prefix, Ssl
+# так же подставляются клиентом), Forwarded, заголовки отдельных CDN
+# и прокси. Разделитель — «-» или «_»: часть серверов приложений считает
+# X_Forwarded_For тем же заголовком, что X-Forwarded-For.
 
 rules:
   - id: go-untrusted-forwarded-headers
     languages: [go]
     severity: ERROR
     message: >-
-      Заголовок с адресом клиента читается напрямую. Его может подставить
-      любой клиент; доверять ему можно только от явно заданных доверенных
-      прокси, и только через модуль, который это проверяет. CLAUDE.md,
-      раздел «Запрещено»; угроза T1.
+      Заголовок о клиенте или исходном запросе (X-Forwarded-*, X-Real-IP
+      и подобные) читается напрямую. Его может подставить любой клиент;
+      доверять ему можно только от явно заданных доверенных прокси, и только
+      через пакет sensor/internal/forwarded, который это проверяет.
+      CLAUDE.md, раздел «Запрещено»; угроза T1; ADR-0022.
+    paths:
+      exclude:
+        - /sensor/internal/forwarded/
     pattern-either:
-      - pattern: $R.Header.Get("=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/")
-      - pattern: $R.Header.Values("=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/")
-      - pattern: $R.Header["=~/(?i)^(x-forwarded-for|x-real-ip|forwarded|true-client-ip|cf-connecting-ip|x-client-ip|x-cluster-client-ip)$/"]
+      - pattern: $R.Header.Get("=~/(?i)^(x[-_]forwarded[-_][a-z0-9_-]+|forwarded|x[-_]real[-_]ip|true[-_]client[-_]ip|cf[-_]connecting[-_]ip|x[-_]client[-_]ip|x[-_]cluster[-_]client[-_]ip)$/")
+      - pattern: $R.Header.Values("=~/(?i)^(x[-_]forwarded[-_][a-z0-9_-]+|forwarded|x[-_]real[-_]ip|true[-_]client[-_]ip|cf[-_]connecting[-_]ip|x[-_]client[-_]ip|x[-_]cluster[-_]client[-_]ip)$/")
+      - pattern: $R.Header["=~/(?i)^(x[-_]forwarded[-_][a-z0-9_-]+|forwarded|x[-_]real[-_]ip|true[-_]client[-_]ip|cf[-_]connecting[-_]ip|x[-_]client[-_]ip|x[-_]cluster[-_]client[-_]ip)$/"]

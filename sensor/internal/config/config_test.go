@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -58,6 +59,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel по умолчанию = %s, ожидался info", cfg.LogLevel)
 	}
+	// По умолчанию не доверяем никому: X-Forwarded-For не читается.
+	if len(cfg.TrustedProxies) != 0 {
+		t.Errorf("TrustedProxies по умолчанию = %v, ожидался пустой список", cfg.TrustedProxies)
+	}
 	if w := cfg.Warnings(); len(w) != 0 {
 		t.Errorf("конфигурация по умолчанию не должна давать предупреждений, получено: %v", w)
 	}
@@ -75,6 +80,7 @@ func TestLoadReadsEnvironment(t *testing.T) {
 		"SENSOR_LISTEN_ADDR":      "0.0.0.0:8443",
 		"SENSOR_UPSTREAM_URL":     " https://app.internal:8443/ ",
 		"SENSOR_MAX_CONNS":        "5000",
+		"SENSOR_TRUSTED_PROXIES":  " 10.0.0.5 , 10.0.1.0/24,fd00::/8, 2001:db8::1 ",
 	}))
 	if err != nil {
 		t.Fatalf("Load вернул ошибку: %v", err)
@@ -90,6 +96,10 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	}
 	if cfg.MaxConns != 5000 {
 		t.Errorf("MaxConns = %d, ожидалось 5000", cfg.MaxConns)
+	}
+	// Одиночный адрес становится сетью из одного адреса.
+	if got := fmt.Sprint(cfg.TrustedProxies); got != "[10.0.0.5/32 10.0.1.0/24 fd00::/8 2001:db8::1/128]" {
+		t.Errorf("TrustedProxies = %s", got)
 	}
 
 	if cfg.AdminAddr != "127.0.0.1:18080" {
@@ -143,6 +153,22 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{"нулевой предел соединений", map[string]string{"SENSOR_MAX_CONNS": "0"}, "от 1"},
 		{"отрицательный предел соединений", map[string]string{"SENSOR_MAX_CONNS": "-5"}, "от 1"},
 		{"предел соединений с лишними нулями", map[string]string{"SENSOR_MAX_CONNS": "1000000"}, "от 1"},
+
+		// Доверенные прокси: любая ошибка здесь — подделка адреса клиента
+		// или сломанное определение адреса, поэтому отказ, а не догадка.
+		{"весь интернет IPv4", map[string]string{"SENSOR_TRUSTED_PROXIES": "0.0.0.0/0"}, "шире /8"},
+		{"весь интернет IPv6", map[string]string{"SENSOR_TRUSTED_PROXIES": "::/0"}, "шире /7"},
+		{"половина интернета", map[string]string{"SENSOR_TRUSTED_PROXIES": "0.0.0.0/1, 128.0.0.0/1"}, "шире /8"},
+		{"все глобальные IPv6", map[string]string{"SENSOR_TRUSTED_PROXIES": "2000::/3"}, "шире /7"},
+		{"биты узла в адресе сети", map[string]string{"SENSOR_TRUSTED_PROXIES": "10.0.0.1/8"}, "10.0.0.0/8"},
+		{"IPv4 в записи IPv6", map[string]string{"SENSOR_TRUSTED_PROXIES": "::ffff:10.0.0.1"}, "как IPv4"},
+		{"сеть IPv4 в записи IPv6", map[string]string{"SENSOR_TRUSTED_PROXIES": "::ffff:10.0.0.0/104"}, "как IPv4"},
+		{"зона IPv6", map[string]string{"SENSOR_TRUSTED_PROXIES": "fe80::1%eth0"}, "зона"},
+		{"имя хоста", map[string]string{"SENSOR_TRUSTED_PROXIES": "lb.internal"}, "10.0.0.0/24"},
+		{"маска числом", map[string]string{"SENSOR_TRUSTED_PROXIES": "10.0.0.0/255.0.0.0"}, "10.0.0.0/24"},
+		{"лишняя запятая", map[string]string{"SENSOR_TRUSTED_PROXIES": "10.0.0.1,"}, "пустой элемент"},
+		{"точка с запятой вместо запятой", map[string]string{"SENSOR_TRUSTED_PROXIES": "10.0.0.1; 10.0.0.2"}, "10.0.0.0/24"},
+		{"слишком много записей", map[string]string{"SENSOR_TRUSTED_PROXIES": strings.Repeat("10.0.0.1,", 1024) + "10.0.0.1"}, "не больше 1024"},
 	}
 
 	for _, tt := range tests {
@@ -165,6 +191,18 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestTrustedProxiesWidestAccepted: самые широкие допустимые сети
+// принимаются — граница проверки не должна отсечь настоящую частную сеть.
+func TestTrustedProxiesWidestAccepted(t *testing.T) {
+	t.Parallel()
+
+	for _, v := range []string{"10.0.0.0/8", "fc00::/7"} {
+		if _, err := Load(envMap(map[string]string{"SENSOR_TRUSTED_PROXIES": v})); err != nil {
+			t.Errorf("%s должна приниматься: %v", v, err)
+		}
 	}
 }
 
