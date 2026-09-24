@@ -1,13 +1,13 @@
 // Команда sensor — точка входа сенсора web-deception.
 //
-// На этом шаге сенсор ещё не проксирует трафик. Он умеет ровно три вещи:
-// прочитать и проверить конфигурацию, поднять служебный слушатель
-// (/healthz, /readyz) и корректно завершиться по сигналу. Проксирование,
-// приманки и события появятся на этапе 2.
+// Сенсор поднимает два слушателя:
+//   - клиентский — принимает трафик из сети и передаёт его защищаемому
+//     приложению (пакет proxy);
+//   - служебный — /healthz и /readyz для проверок живости, только на
+//     localhost по умолчанию (пакет admin).
 //
-// Эти три вещи выбраны не случайно — на них держится всё остальное.
-// Сенсор, который не умеет корректно останавливаться, рвёт живые запросы
-// клиентов при каждом обновлении.
+// Приманок и событий пока нет: на этом шаге сенсор — прозрачный прокси.
+// Они появятся на следующих шагах этапа 2.
 package main
 
 import (
@@ -26,6 +26,7 @@ import (
 	"github.com/azuresong-afk/web_deception/sensor/internal/admin"
 	"github.com/azuresong-afk/web_deception/sensor/internal/config"
 	"github.com/azuresong-afk/web_deception/sensor/internal/healthcheck"
+	"github.com/azuresong-afk/web_deception/sensor/internal/proxy"
 	"github.com/azuresong-afk/web_deception/sensor/internal/version"
 )
 
@@ -75,14 +76,20 @@ func main() {
 	}
 }
 
+// listenAddrs — фактические адреса обоих слушателей после открытия.
+type listenAddrs struct {
+	Admin net.Addr
+	Proxy net.Addr
+}
+
 // run поднимает сенсор и работает, пока контекст не будет отменён сигналом.
 //
-// Параметр onListen вызывается с фактическим адресом слушателя сразу после
-// его открытия. В main он не нужен и передаётся nil; он существует ради
+// Параметр onListen вызывается с фактическими адресами слушателей сразу
+// после их открытия. В main он не нужен и передаётся nil; он существует ради
 // тестов, которые запускают сенсор на порту 0 (любой свободный) и иначе
 // не смогли бы узнать, куда стучаться. Альтернатива — фиксированный порт
 // в тестах — делает тесты нестабильными: порт может быть занят.
-func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen func(net.Addr)) error {
+func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen func(listenAddrs)) error {
 	// NotifyContext отменяет контекст при SIGINT (Ctrl+C) или SIGTERM.
 	// SIGTERM посылают docker stop и Kubernetes. Без его обработки
 	// контейнер живёт положенные секунды и получает SIGKILL, который
@@ -92,9 +99,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 
 	var ready atomic.Bool
 
-	srv := admin.NewServer(admin.NewHandler(&ready), logger)
+	adminSrv := admin.NewServer(admin.NewHandler(&ready), logger)
+	proxySrv := proxy.NewServer(proxy.NewHandler(cfg.Upstream, logger), logger)
 
-	// Слушатель открываем синхронно, до запуска горутины. Если порт занят,
+	// Слушатели открываем синхронно, до запуска горутин. Если порт занят,
 	// сенсор должен упасть сразу с понятной ошибкой. Вариант с
 	// ListenAndServe внутри горутины приводит к тому, что процесс
 	// рапортует об успешном старте и молча не слушает ничего.
@@ -103,51 +111,70 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	// хоста, его разрешение при старте может зависнуть, и без контекста
 	// такое зависание нельзя прервать даже сигналом остановки.
 	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", cfg.AdminAddr)
+	adminLn, err := lc.Listen(ctx, "tcp", cfg.AdminAddr)
 	if err != nil {
 		return fmt.Errorf("не удалось открыть служебный слушатель на %s: %w", cfg.AdminAddr, err)
 	}
+	proxyLn, err := lc.Listen(ctx, "tcp", cfg.ListenAddr)
+	if err != nil {
+		_ = adminLn.Close()
+		return fmt.Errorf("не удалось открыть клиентский слушатель на %s: %w", cfg.ListenAddr, err)
+	}
+	// Предел соединений — только на клиентском слушателе: служебный
+	// по умолчанию доступен лишь с самой машины, и ограничивать проверки
+	// живости значило бы рисковать ложным «сенсор мёртв» под нагрузкой.
+	proxyLn = proxy.LimitListener(proxyLn, cfg.MaxConns, proxy.SaturationLogger(logger, cfg.MaxConns))
 
-	// Буфер на один элемент: горутина должна суметь записать результат
+	// Буфер на оба сервера: каждая горутина должна суметь записать результат
 	// и завершиться, даже если никто ещё не читает канал. Без буфера
 	// она зависнет навсегда, и это утечка горутины.
-	serveErr := make(chan error, 1)
-	go func() {
+	serveErr := make(chan error, 2)
+	serve := func(name string, srv *http.Server, ln net.Listener) {
 		// Serve всегда возвращает ошибку, никогда nil. После Shutdown
 		// это http.ErrServerClosed — штатное завершение, а не сбой.
 		err := srv.Serve(ln)
 		if errors.Is(err, http.ErrServerClosed) {
-			err = nil
+			serveErr <- nil
+			return
 		}
-		serveErr <- err
-	}()
+		serveErr <- fmt.Errorf("%s: %w", name, err)
+	}
+	go serve("служебный слушатель", adminSrv, adminLn)
+	go serve("клиентский слушатель", proxySrv, proxyLn)
 
 	ready.Store(true)
 	logger.Info("сенсор запущен",
-		slog.String("admin_addr", ln.Addr().String()),
+		slog.String("listen_addr", proxyLn.Addr().String()),
+		slog.String("upstream", cfg.Upstream.String()),
+		slog.Int("max_conns", cfg.MaxConns),
+		slog.String("admin_addr", adminLn.Addr().String()),
 		slog.String("version", version.Version),
 	)
 	if onListen != nil {
-		onListen(ln.Addr())
+		onListen(listenAddrs{Admin: adminLn.Addr(), Proxy: proxyLn.Addr()})
 	}
 
+	// Ждём сигнала — или того, что один из серверов упал сам. Во втором
+	// случае останавливаем и другой: сенсор без клиентского слушателя
+	// бесполезен, а без служебного — невидим для проверок живости,
+	// и оркестратор не узнает, что его пора перезапустить.
+	var runErr error
+	pending := 2
 	select {
-	case err := <-serveErr:
-		// Сервер упал сам, без сигнала на остановку.
-		return err
+	case runErr = <-serveErr:
+		pending = 1
 	case <-ctx.Done():
 	}
 
 	// Порядок здесь важен. Сначала снимаем готовность, и только потом
-	// останавливаем сервер: балансировщик или kubelet, опрашивающий
-	// /readyz, успеет увести трафик до того, как сервер перестанет
+	// останавливаем серверы: балансировщик или kubelet, опрашивающий
+	// /readyz, успеет увести трафик до того, как сенсор перестанет
 	// принимать соединения.
 	//
 	// В боевом развёртывании между этими двумя действиями нужна пауза
-	// на длительность одного интервала опроса. Добавим её на этапе 10,
-	// когда сенсор будет нести реальный трафик и пауза станет осмысленной.
+	// на длительность одного интервала опроса. Добавим её на этапе 10.
 	ready.Store(false)
-	logger.Info("получен сигнал остановки, завершаем активные запросы",
+	logger.Info("остановка: завершаем активные запросы",
 		// Duration в JSON выводится наносекундами ("10000000000"), что
 		// нечитаемо в логе. Отдаём строку "10s".
 		slog.String("timeout", cfg.ShutdownTimeout.String()),
@@ -159,12 +186,25 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("активные запросы не завершились за %s: %w", cfg.ShutdownTimeout, err)
+	// Сначала клиентский слушатель: он дожидается активных запросов клиентов.
+	// Служебный — последним, чтобы до конца отвечать на проверки.
+	if err := proxySrv.Shutdown(shutdownCtx); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("активные запросы не завершились за %s: %w", cfg.ShutdownTimeout, err))
+	}
+	if err := adminSrv.Shutdown(shutdownCtx); err != nil {
+		runErr = errors.Join(runErr, fmt.Errorf("служебный слушатель не остановился: %w", err))
+	}
+	for range pending {
+		if err := <-serveErr; err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}
+	if runErr != nil {
+		return runErr
 	}
 
 	logger.Info("сенсор остановлен")
-	return <-serveErr
+	return nil
 }
 
 // runHealthcheck выполняет одну проверку готовности и возвращает код выхода.

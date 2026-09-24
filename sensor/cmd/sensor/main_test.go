@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -42,39 +44,70 @@ func httpGet(t *testing.T, url string) (int, string) {
 	return resp.StatusCode, string(body)
 }
 
-// TestRunServesAndShutsDownGracefully — единственный тест, который поднимает
-// сенсор целиком: настоящий слушатель, настоящие сетевые запросы, настоящая
-// остановка по отмене контекста.
-func TestRunServesAndShutsDownGracefully(t *testing.T) {
-	cfg := &config.Config{
-		// Порт 0 означает «любой свободный». Фиксированный порт в тесте
-		// сделал бы его нестабильным: порт может быть занят на машине
-		// разработчика или другим тестом в CI.
+// testConfig — конфигурация для тестов: оба слушателя на порту 0.
+//
+// Порт 0 означает «любой свободный». Фиксированный порт в тесте сделал бы
+// его нестабильным: порт может быть занят на машине разработчика или другим
+// тестом в CI.
+func testConfig(t *testing.T, upstream string) *config.Config {
+	t.Helper()
+
+	u, err := url.Parse(upstream)
+	if err != nil {
+		t.Fatalf("адрес приложения для теста: %v", err)
+	}
+	return &config.Config{
+		ListenAddr:      "127.0.0.1:0",
+		Upstream:        u,
+		MaxConns:        64,
 		AdminAddr:       "127.0.0.1:0",
 		ShutdownTimeout: 5 * time.Second,
 		LogLevel:        slog.LevelError,
 	}
+}
+
+// startSensor запускает сенсор в горутине и возвращает адреса слушателей
+// и канал с результатом run.
+func startSensor(ctx context.Context, t *testing.T, cfg *config.Config) (listenAddrs, <-chan error) {
+	t.Helper()
+
+	addrCh := make(chan listenAddrs, 1)
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- run(ctx, cfg, silentLogger(), func(a listenAddrs) { addrCh <- a })
+	}()
+
+	select {
+	case a := <-addrCh:
+		return a, runErr
+	case err := <-runErr:
+		t.Fatalf("сенсор завершился, не начав слушать: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("сенсор не открыл слушатели за 10 секунд")
+	}
+	return listenAddrs{}, nil
+}
+
+// TestRunServesAndShutsDownGracefully — единственный тест, который поднимает
+// сенсор целиком: настоящие слушатели, настоящие сетевые запросы через
+// сенсор в приложение, настоящая остановка по отмене контекста.
+func TestRunServesAndShutsDownGracefully(t *testing.T) {
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ответ приложения на "+r.URL.Path)
+	}))
+	defer app.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	addrCh := make(chan net.Addr, 1)
-	runErr := make(chan error, 1)
+	addrs, runErr := startSensor(ctx, t, testConfig(t, app.URL))
+	base := "http://" + addrs.Admin.String()
 
-	go func() {
-		runErr <- run(ctx, cfg, silentLogger(), func(a net.Addr) { addrCh <- a })
-	}()
-
-	var addr net.Addr
-	select {
-	case addr = <-addrCh:
-	case err := <-runErr:
-		t.Fatalf("сенсор завершился, не начав слушать: %v", err)
-	case <-time.After(10 * time.Second):
-		t.Fatal("сенсор не открыл слушатель за 10 секунд")
+	// Запрос через клиентский слушатель доходит до приложения, и его ответ
+	// возвращается клиенту без изменений.
+	if code, body := httpGet(t, "http://"+addrs.Proxy.String()+"/catalog"); code != http.StatusOK || body != "ответ приложения на /catalog" {
+		t.Errorf("запрос через сенсор вернул %d %q, ожидался ответ приложения", code, body)
 	}
-
-	base := "http://" + addr.String()
 
 	if code, body := httpGet(t, base+"/healthz"); code != http.StatusOK || body != "ok\n" {
 		t.Errorf("/healthz на живом сенсоре вернул %d %q, ожидалось 200 \"ok\\n\"", code, body)
@@ -98,13 +131,15 @@ func TestRunServesAndShutsDownGracefully(t *testing.T) {
 		t.Fatal("сенсор не завершился за 15 секунд после сигнала остановки")
 	}
 
-	// После остановки слушатель должен быть закрыт. Если сенсор продолжает
-	// отвечать, значит Shutdown не отработал, и при обновлении в проде
-	// останутся висеть два процесса на одном порту.
+	// После остановки оба слушателя должны быть закрыты. Если сенсор
+	// продолжает отвечать, значит Shutdown не отработал, и при обновлении
+	// в проде останутся висеть два процесса на одном порту.
 	client := &http.Client{Timeout: 2 * time.Second}
-	if resp, err := client.Get(base + "/healthz"); err == nil {
-		_ = resp.Body.Close()
-		t.Error("сенсор отвечает после остановки: слушатель не закрыт")
+	for _, u := range []string{base + "/healthz", "http://" + addrs.Proxy.String() + "/"} {
+		if resp, err := client.Get(u); err == nil {
+			_ = resp.Body.Close()
+			t.Errorf("сенсор отвечает на %s после остановки: слушатель не закрыт", u)
+		}
 	}
 }
 
@@ -120,49 +155,41 @@ func TestRunFailsWhenAddressIsBusy(t *testing.T) {
 	}
 	defer func() { _ = busy.Close() }()
 
-	cfg := &config.Config{
-		AdminAddr:       busy.Addr().String(),
-		ShutdownTimeout: time.Second,
-		LogLevel:        slog.LevelError,
-	}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := run(ctx, cfg, silentLogger(), nil); err == nil {
-		t.Fatal("ожидалась ошибка при занятом порте, получен nil")
+	// Занятым может оказаться любой из двух портов — сенсор должен упасть
+	// в обоих случаях, а не работать наполовину.
+	adminBusy := testConfig(t, "http://127.0.0.1:1")
+	adminBusy.AdminAddr = busy.Addr().String()
+	if err := run(ctx, adminBusy, silentLogger(), nil); err == nil {
+		t.Error("ожидалась ошибка при занятом служебном порте, получен nil")
+	}
+
+	proxyBusy := testConfig(t, "http://127.0.0.1:1")
+	proxyBusy.ListenAddr = busy.Addr().String()
+	if err := run(ctx, proxyBusy, silentLogger(), nil); err == nil {
+		t.Error("ожидалась ошибка при занятом клиентском порте, получен nil")
 	}
 }
 
 // TestHealthcheckCommand проверяет подкоманду так, как её вызывает Docker:
 // по адресу из переменной окружения, с кодом выхода 0 или 1.
 func TestHealthcheckCommand(t *testing.T) {
-	cfg := &config.Config{
-		AdminAddr:       "127.0.0.1:0",
-		ShutdownTimeout: 5 * time.Second,
-		LogLevel:        slog.LevelError,
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	addrCh := make(chan net.Addr, 1)
-	runErr := make(chan error, 1)
-	go func() {
-		runErr <- run(ctx, cfg, silentLogger(), func(a net.Addr) { addrCh <- a })
-	}()
-
-	var addr string
-	select {
-	case a := <-addrCh:
-		addr = a.String()
-	case <-time.After(10 * time.Second):
-		t.Fatal("сенсор не открыл слушатель за 10 секунд")
-	}
+	addrs, runErr := startSensor(ctx, t, testConfig(t, "http://127.0.0.1:1"))
+	addr := addrs.Admin.String()
 
 	env := func(k string) string {
-		if k == "SENSOR_ADMIN_ADDR" {
+		switch k {
+		case "SENSOR_ADMIN_ADDR":
 			return addr
+		case "SENSOR_UPSTREAM_URL":
+			// Контейнер получает те же переменные окружения, что и сам
+			// сенсор, поэтому адрес приложения в них есть всегда.
+			return "http://app:3000"
 		}
 		return ""
 	}

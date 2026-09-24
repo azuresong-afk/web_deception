@@ -2,9 +2,9 @@
 
 ```
 docker/sensor.Dockerfile          образ сенсора: distroless, ~4 МБ, без shell
-docker/controlplane.Dockerfile    образ control plane: python slim без pip
+docker/controlplane.Dockerfile    образ control plane: distroless с Python 3.13, без shell
 docker/requirements-build.txt     uv для сборки, с контрольными суммами
-compose/compose.yaml              весь стек для локальной разработки
+compose/compose.yaml              стек для разработки; Juice Shop за сенсором — профиль demo
 compose/nats.conf                 своя конфигурация NATS вместо файла из образа
 compose/secrets/                  локальные секреты; создаются `make secrets`, в git не попадают
 ```

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -37,11 +38,41 @@ const (
 	maxShutdownTimeout = 60 * time.Second
 
 	defaultLogLevel = slog.LevelInfo
+
+	// Клиентский слушатель, в отличие от служебного, по умолчанию открыт
+	// на всех интерфейсах: принимать трафик из сети — его работа. За ним
+	// нет ничего, что не было бы уже открыто самим приложением клиента.
+	defaultListenAddr = ":8080"
+
+	// Предел одновременных соединений клиентов. Каждое соединение с активным
+	// запросом стоит порядка десятков килобайт (буферы чтения, записи,
+	// копирования тела), и тысяча таких — это десятки мегабайт. Значение
+	// по умолчанию рассчитано на лимит памяти контейнера 128 МБ; поднимать
+	// его нужно вместе с лимитом памяти.
+	defaultMaxConns = 1024
+
+	// Верхняя граница отсекает опечатку с лишними нулями: миллион соединений
+	// не выдержит ни один разумный лимит памяти, и сенсор упадёт раньше,
+	// чем предел сработает.
+	maxMaxConns = 100_000
 )
 
-// Config — конфигурация сенсора на текущем этапе. Проксирования трафика ещё
-// нет, поэтому здесь только служебный слушатель и параметры остановки.
+// Config — конфигурация сенсора: слой запуска по ADR-0018. Здесь только то,
+// что задаётся при развёртывании и определяет границы доверия. Политика
+// обнаружения (приманки, правила) появится отдельно на шаге 8.
 type Config struct {
+	// ListenAddr — адрес клиентского слушателя: сюда приходит трафик,
+	// который сенсор передаёт приложению.
+	ListenAddr string
+
+	// Upstream — адрес защищаемого приложения. Берётся только отсюда
+	// и никогда из запроса: иначе сенсор становится открытым прокси,
+	// через который можно ходить во внутреннюю сеть (угроза T17).
+	Upstream *url.URL
+
+	// MaxConns — предел одновременных соединений клиентов.
+	MaxConns int
+
 	// AdminAddr — адрес служебного слушателя (/healthz, /readyz).
 	AdminAddr string
 
@@ -65,9 +96,41 @@ type Getenv func(string) string
 // «запустился, но слушает не тот адрес» — худший из возможных исходов.
 func Load(getenv Getenv) (*Config, error) {
 	cfg := &Config{
+		ListenAddr:      defaultListenAddr,
+		MaxConns:        defaultMaxConns,
 		AdminAddr:       defaultAdminAddr,
 		ShutdownTimeout: defaultShutdownTimeout,
 		LogLevel:        defaultLogLevel,
+	}
+
+	// Адрес приложения обязателен. Значения по умолчанию нет намеренно:
+	// любое угаданное значение — это трафик клиента, отправленный не туда.
+	v := strings.TrimSpace(getenv("SENSOR_UPSTREAM_URL"))
+	if v == "" {
+		return nil, fmt.Errorf("SENSOR_UPSTREAM_URL: не задан адрес защищаемого приложения, например http://app:3000")
+	}
+	u, err := parseUpstream(v)
+	if err != nil {
+		return nil, fmt.Errorf("SENSOR_UPSTREAM_URL: %w", err)
+	}
+	cfg.Upstream = u
+
+	if v := strings.TrimSpace(getenv("SENSOR_LISTEN_ADDR")); v != "" {
+		if err := validateAddr(v); err != nil {
+			return nil, fmt.Errorf("SENSOR_LISTEN_ADDR: %w", err)
+		}
+		cfg.ListenAddr = v
+	}
+
+	if v := strings.TrimSpace(getenv("SENSOR_MAX_CONNS")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("SENSOR_MAX_CONNS: ожидается целое число, получено %q", v)
+		}
+		if n < 1 || n > maxMaxConns {
+			return nil, fmt.Errorf("SENSOR_MAX_CONNS: допустимо от 1 до %d, получено %d", maxMaxConns, n)
+		}
+		cfg.MaxConns = n
 	}
 
 	if v := strings.TrimSpace(getenv("SENSOR_ADMIN_ADDR")); v != "" {
@@ -99,7 +162,57 @@ func Load(getenv Getenv) (*Config, error) {
 		cfg.LogLevel = lvl
 	}
 
+	// Два слушателя на одном адресе — это не «один из них не запустится»,
+	// а непредсказуемо, какой именно: лучше отказаться стартовать сразу.
+	if cfg.ListenAddr == cfg.AdminAddr {
+		return nil, fmt.Errorf("SENSOR_LISTEN_ADDR и SENSOR_ADMIN_ADDR совпадают (%s): "+
+			"служебный слушатель не должен делить порт с клиентским", cfg.ListenAddr)
+	}
+
 	return cfg, nil
+}
+
+// parseUpstream разбирает и проверяет адрес защищаемого приложения.
+//
+// Разрешён только самый простой вид: схема, хост и необязательный порт.
+// Всё остальное отвергается, а не молча игнорируется — каждое такое поле
+// означало бы поведение, которого администратор не ожидает:
+//   - логин и пароль в адресе — секрет в переменной, которую видно в
+//     docker inspect, да ещё и непонятно, передавать ли его приложению;
+//   - путь — непонятно, как склеивать его с путём запроса;
+//   - параметры и фрагмент — непонятно, добавлять ли их к каждому запросу.
+//
+// Имя хоста при старте не разрешается в IP: DNS может быть ещё недоступен
+// (контейнер приложения стартует параллельно), а разрешение на каждое
+// соединение даёт и так транспорт HTTP.
+func parseUpstream(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("не удалось разобрать адрес %q", raw)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("схема должна быть http или https, получено %q", u.Scheme)
+	}
+	if u.Opaque != "" || u.Host == "" || u.Hostname() == "" {
+		return nil, fmt.Errorf("в адресе нет имени хоста: %q", raw)
+	}
+	if u.User != nil {
+		// В сообщение адрес целиком не выводим: в нём пароль.
+		return nil, fmt.Errorf("логин и пароль в адресе приложения не поддерживаются")
+	}
+	if u.Path != "" && u.Path != "/" {
+		return nil, fmt.Errorf("путь в адресе приложения пока не поддерживается, получено %q", u.Path)
+	}
+	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+		return nil, fmt.Errorf("параметры и фрагмент в адресе приложения не поддерживаются: %q", raw)
+	}
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("порт вне диапазона 1-65535: %q", port)
+		}
+	}
+	return &url.URL{Scheme: u.Scheme, Host: u.Host}, nil
 }
 
 // Warnings возвращает предупреждения о конфигурации, которая формально
@@ -128,6 +241,11 @@ func (c *Config) Warnings() []string {
 
 	if port == "0" {
 		out = append(out, "порт служебного слушателя равен 0: адрес будет выбран случайно при каждом запуске; "+
+			"это допустимо только в тестах")
+	}
+
+	if _, listenPort, err := net.SplitHostPort(c.ListenAddr); err == nil && listenPort == "0" {
+		out = append(out, "порт клиентского слушателя равен 0: адрес будет выбран случайно при каждом запуске; "+
 			"это допустимо только в тестах")
 	}
 

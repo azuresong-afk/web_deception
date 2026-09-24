@@ -9,11 +9,12 @@
 package admin
 
 import (
-	"io"
 	"log/slog"
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/azuresong-afk/web_deception/sensor/internal/respond"
 )
 
 // Таймауты HTTP-сервера. Вынесены в константы, а не в конфигурацию,
@@ -71,7 +72,7 @@ var allowedPaths = map[string]struct{}{
 func onlyKnownPaths(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if _, ok := allowedPaths[r.URL.Path]; !ok {
-			writePlain(w, http.StatusNotFound, "not found")
+			respond.Plain(w, http.StatusNotFound, "not found")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -96,7 +97,7 @@ func NewHandler(ready *atomic.Bool) http.Handler {
 	// /healthz — проверка живости: процесс запущен и отвечает.
 	// Отвечает 200 всегда, пока жив процесс.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writePlain(w, http.StatusOK, "ok")
+		respond.Plain(w, http.StatusOK, "ok")
 	})
 
 	// /readyz — проверка готовности: сенсор готов обслуживать запросы.
@@ -106,10 +107,10 @@ func NewHandler(ready *atomic.Bool) http.Handler {
 	// и балансировщик должен увести трафик, а не убивать процесс.
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		if !ready.Load() {
-			writePlain(w, http.StatusServiceUnavailable, "not ready")
+			respond.Plain(w, http.StatusServiceUnavailable, "not ready")
 			return
 		}
-		writePlain(w, http.StatusOK, "ready")
+		respond.Plain(w, http.StatusOK, "ready")
 	})
 
 	return onlyKnownPaths(mux)
@@ -131,27 +132,4 @@ func NewServer(h http.Handler, logger *slog.Logger) *http.Server {
 		// сообщений. Перенаправляем их в наш логгер на уровне warn.
 		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
 	}
-}
-
-// writePlain пишет короткий текстовый ответ.
-//
-// Ответы намеренно не содержат ни названия продукта, ни версии, ни деталей
-// состояния. Служебный эндпоинт, случайно оказавшийся доступным снаружи,
-// не должен помогать опознать продукт (угроза T5). По той же причине здесь
-// нет заголовка Server: Go его не добавляет, и добавлять не нужно.
-func writePlain(w http.ResponseWriter, status int, body string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-
-	// Запрещаем браузеру угадывать тип содержимого вместо объявленного.
-	// Для "ok" это избыточно, но правило должно действовать по умолчанию
-	// во всём продукте, а не выборочно там, где кто-то вспомнил.
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-
-	w.WriteHeader(status)
-
-	// Ошибку записи намеренно игнорируем: она означает, что клиент отвалился
-	// на полуслове. Сделать с этим нечего, а логировать каждый оборванный
-	// запрос — значит дать любому желающему бесплатный способ раздуть
-	// наш лог до размера диска.
-	_, _ = io.WriteString(w, body+"\n")
 }
