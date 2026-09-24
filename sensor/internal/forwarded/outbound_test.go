@@ -29,6 +29,10 @@ var spoofable = map[string]string{
 	"X-Client-Ip":         spoofedIP,
 	"X-Cluster-Client-Ip": spoofedIP,
 	"Forwarded":           "for=" + spoofedIP,
+	// Не о клиенте, а об исходном пути: приложение, которое им верит,
+	// обработало бы другой путь, чем видят прокси и сенсор (ADR-0026).
+	"X-Original-Url": "/admin",
+	"X-Rewrite-Url":  "/admin",
 }
 
 // underscored — варианты с подчёркиванием. Сервер Go приводит имя к виду
@@ -37,6 +41,7 @@ var underscored = map[string]string{
 	"X_forwarded_for":   spoofedIP,
 	"X_forwarded_proto": "https",
 	"X_real_ip":         spoofedIP,
+	"X_original_url":    "/admin",
 }
 
 func TestSetOutboundUntrustedPeer(t *testing.T) {

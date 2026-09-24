@@ -359,6 +359,8 @@ func TestConnectRejected(t *testing.T) {
 //
 // X-Forwarded-Port, -Prefix, -Ssl и вариант с подчёркиванием добавлены
 // на шаге 5: ReverseProxy их не удаляет, и до шага 5 они проходили.
+// X-Original-URL и X-Rewrite-URL — на шаге 9 (ADR-0026): приложение,
+// которое им верит, обработало бы не тот путь, что видит сенсор.
 func TestClientIPHeadersReplaced(t *testing.T) {
 	t.Parallel()
 
@@ -379,6 +381,9 @@ func TestClientIPHeadersReplaced(t *testing.T) {
 		"X-Forwarded-Prefix":  "/1.2.3.4",
 		"X-Forwarded-Ssl":     "1.2.3.4",
 		"X_Forwarded_For":     "1.2.3.4",
+		"X-Original-URL":      "/1.2.3.4",
+		"X-Rewrite-URL":       "/1.2.3.4",
+		"X_Original_URL":      "/1.2.3.4",
 	}
 	var raw strings.Builder
 	raw.WriteString("GET / HTTP/1.1\r\nHost: shop.example\r\n")

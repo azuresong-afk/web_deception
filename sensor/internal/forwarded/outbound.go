@@ -24,6 +24,20 @@ var clientIPHeaders = map[string]bool{
 	"x-cluster-client-ip": true,
 }
 
+// pathOverrideHeaders — заголовки, которыми прокси сообщает приложению
+// исходный путь запроса. Их понимают IIS (URL Rewrite), Symfony, Laminas
+// и другие: приложение берёт путь из заголовка, а не из строки запроса.
+//
+// От клиента это известный обход: «GET / + X-Original-URL: /admin» —
+// прокси и сенсор видят «/», а приложение обрабатывает «/admin». Так
+// обходят запреты на пути в прокси перед приложением и ловушки сенсора,
+// которые сравнивают путь из строки запроса (ADR-0026). Поэтому они
+// проходят к приложению только от доверенного прокси — как X-Forwarded-*.
+var pathOverrideHeaders = map[string]bool{
+	"x-original-url": true,
+	"x-rewrite-url":  true,
+}
+
 // SetOutbound выставляет заголовки о клиенте в запросе, который сенсор
 // отправляет приложению. out — заголовки исходящего запроса, in — входящий
 // запрос, c — результат Resolve для него.
@@ -33,7 +47,8 @@ var clientIPHeaders = map[string]bool{
 //
 //   - Соединение не от доверенного прокси. Удаляются все X-Forwarded-*
 //     (не только For, Host и Proto, которые удаляет ReverseProxy, но и Port,
-//     Prefix, Ssl и любые другие), Forwarded и заголовки из clientIPHeaders.
+//     Prefix, Ssl и любые другие), Forwarded, заголовки из clientIPHeaders
+//     и pathOverrideHeaders.
 //     X-Forwarded-For, -Host и -Proto сенсор выставляет сам по соединению.
 //   - Соединение от доверенного прокси. Его заголовки проходят как есть:
 //     это утверждения нашего прокси, а сенсор должен быть прозрачным
@@ -125,5 +140,6 @@ func normalizeName(name string) string {
 func isForwardingHeader(norm string) bool {
 	return norm == "forwarded" ||
 		strings.HasPrefix(norm, "x-forwarded-") ||
-		clientIPHeaders[norm]
+		clientIPHeaders[norm] ||
+		pathOverrideHeaders[norm]
 }
