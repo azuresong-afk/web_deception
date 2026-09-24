@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -93,19 +94,22 @@ func TestRecorderWritesInOrder(t *testing.T) {
 }
 
 // TestEmitNeverBlocks — главное свойство Recorder: запись зависла, а Emit
-// всё равно возвращается сразу, лишнее отбрасывается и учитывается.
+// всё равно возвращается сразу. Лишнее вытесняется: теряются старые
+// события, а самое свежее обязательно доходит до файла.
 func TestEmitNeverBlocks(t *testing.T) {
 	t.Parallel()
 
 	sink := &memSink{block: make(chan struct{})}
-	const queue = 4
+	const queue, total = 4, 100
 	r := NewRecorder(sink, queue, discard())
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for range 100 {
-			r.Emit(New(TypeConnectRejected, SeverityLow))
+		for i := range total {
+			ev := New(TypeConnectRejected, SeverityLow)
+			ev.Data = map[string]string{"n": strconv.Itoa(i)}
+			r.Emit(ev)
 		}
 	}()
 	select {
@@ -114,20 +118,23 @@ func TestEmitNeverBlocks(t *testing.T) {
 		t.Fatal("Emit ждёт зависшую запись: обработчик запроса задержал бы трафик")
 	}
 
-	// Одно событие горутина записи держит в зависшем Write, queue — в буфере,
-	// остальные отброшены. Сколько именно успела взять горутина — вопрос
-	// расписания, поэтому проверяем границы, а не точное число.
-	dropped := r.Stats.DroppedQueueFull.Load()
-	if dropped < 100-queue-1 || r.Stats.Emitted.Load()+dropped != 100 {
-		t.Errorf("принято %d, отброшено %d из 100 при буфере %d",
-			r.Stats.Emitted.Load(), dropped, queue)
-	}
-
 	close(sink.block)
 	closeRecorder(t, r)
-	if got := uint64(len(sink.snapshot())); got != r.Stats.Emitted.Load() {
-		t.Errorf("записано %d, принято %d: принятые события должны дописаться при остановке",
-			got, r.Stats.Emitted.Load())
+
+	lines := sink.snapshot()
+	// Одно событие горутина записи держала в зависшем Write, queue — в буфере.
+	// Сколько именно успела взять горутина — вопрос расписания.
+	if len(lines) < queue || len(lines) > queue+1 {
+		t.Errorf("записано %d событий, ожидалось %d–%d", len(lines), queue, queue+1)
+	}
+	var last Event
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil || last.Data["n"] != strconv.Itoa(total-1) {
+		t.Errorf("последним записано событие %q, ожидалось самое свежее %d", last.Data["n"], total-1)
+	}
+	// Каждое событие либо записано, либо учтено как потерянное.
+	if got := r.Stats.Written.Load() + r.Stats.DroppedQueueFull.Load(); got != total {
+		t.Errorf("записано %d + потеряно %d = %d, ожидалось %d",
+			r.Stats.Written.Load(), r.Stats.DroppedQueueFull.Load(), got, total)
 	}
 }
 
@@ -246,10 +253,13 @@ func TestConcurrentEmitAndClose(t *testing.T) {
 	closeRecorder(t, r)
 	wg.Wait()
 
+	// Учёт точный: каждое событие либо записано, либо ровно в одном
+	// счётчике потерь — даже те, что пришли в момент остановки.
 	s := &r.Stats
-	total := s.Emitted.Load() + s.DroppedQueueFull.Load() + s.DroppedStopped.Load()
+	total := s.Written.Load() + s.DroppedWriteError.Load() + s.DroppedQueueFull.Load() + s.DroppedStopped.Load()
 	if total != 100*50 {
-		t.Errorf("учтено %d событий из %d: каждое должно быть либо принято, либо учтено как потерянное", total, 100*50)
+		t.Errorf("учтено %d событий из %d: записано %d, потеряно: буфер %d, остановка %d",
+			total, 100*50, s.Written.Load(), s.DroppedQueueFull.Load(), s.DroppedStopped.Load())
 	}
 }
 
