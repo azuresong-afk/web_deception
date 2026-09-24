@@ -322,6 +322,126 @@ func TestRunServesTrapsAndReloadsOnHUP(t *testing.T) {
 	}
 }
 
+// TestRunCrossSiteTraps — ловушки, устойчивые к межсайтовым срабатываниям,
+// через настоящий прокси. Приложение одобряет CORS для любого сайта
+// и ставит свою cookie, как Juice Shop: сенсор должен не дать одобрить
+// preflight к ловушке и не потерять ни свою наживку, ни cookie приложения.
+func TestRunCrossSiteTraps(t *testing.T) {
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "content-type")
+		w.Header().Add("Set-Cookie", "session=app-session; Path=/")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_, _ = io.WriteString(w, "ответ приложения")
+	}))
+	defer app.Close()
+
+	cfg := testConfig(t, app.URL)
+	dir := t.TempDir()
+	cfg.PolicyFile = filepath.Join(dir, "policy.json")
+	cfg.PolicyCacheFile = filepath.Join(dir, "policy.last-valid.json")
+	policy := `{"schema_version":1,"version":"v1","traps":[{"id":"api-export","path":"/api/internal/export",` +
+		`"mode":"enforce","confidence":"high","methods":["POST"],"preflight_only":true,` +
+		`"response":{"status":200,"content_type":"application/json","body":"{\"job\":1}"}}],` +
+		`"cookie_traps":[{"id":"role-cookie","name":"user_role","value":"customer","confidence":"high"}]}`
+	if err := os.WriteFile(cfg.PolicyFile, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addrs, runErr := startSensor(ctx, t, cfg)
+	base := "http://" + addrs.Proxy.String()
+
+	// reply — то, что получил клиент.
+	type reply struct {
+		code   int
+		header http.Header
+		body   string
+	}
+	do := func(method, path string, headers ...string) reply {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, method, base+path, strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < len(headers); i += 2 {
+			req.Header.Set(headers[i], headers[i+1])
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if cerr := resp.Body.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reply{resp.StatusCode, resp.Header, string(body)}
+	}
+
+	// Переход по странице: наживка и cookie приложения — обе.
+	cookies := strings.Join(do(http.MethodGet, "/", "Sec-Fetch-Mode", "navigate").header.Values("Set-Cookie"), "|")
+	if !strings.Contains(cookies, "user_role=customer; Path=/; HttpOnly; SameSite=Strict") ||
+		!strings.Contains(cookies, "session=app-session") {
+		t.Errorf("Set-Cookie после прокси: %q", cookies)
+	}
+
+	// Preflight с чужого сайта: приложение одобрило бы, сенсор — нет.
+	pre := do(http.MethodOptions, "/api/internal/export",
+		"Origin", "https://evil.example", "Access-Control-Request-Method", "POST")
+	if pre.code != http.StatusNoContent || pre.header.Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("preflight к ловушке одобрен: %d %v", pre.code, pre.header)
+	}
+
+	// Форму может отправить чужая страница — не касание, ответ приложения.
+	if r := do(http.MethodPost, "/api/internal/export", "Content-Type", "application/x-www-form-urlencoded"); r.body != "ответ приложения" {
+		t.Errorf("POST формы: %q", r.body)
+	}
+	// JSON — только со своей страницы или не из браузера: ловушка.
+	if r := do(http.MethodPost, "/api/internal/export", "Content-Type", "application/json"); r.body != `{"job":1}` {
+		t.Errorf("POST JSON: %q", r.body)
+	}
+	// Изменённая cookie: ответ приложения, касание в событиях.
+	if r := do(http.MethodGet, "/account", "Cookie", "user_role=TAMPERED-admin"); r.body != "ответ приложения" {
+		t.Errorf("запрос с изменённой cookie: %q", r.body)
+	}
+
+	_, metricsBody := httpGet(t, "http://"+addrs.Admin.String()+"/metrics")
+	for _, want := range []string{
+		"sensor_cookie_touches_total 1\n", "sensor_cookie_baits_total 1\n",
+		"sensor_preflights_refused_total 1\n", `sensor_decoy_touches_total{mode="enforce"} 1` + "\n",
+		"sensor_policy_traps 2\n",
+	} {
+		if !strings.Contains(metricsBody, want) {
+			t.Errorf("в /metrics нет %q", want)
+		}
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("остановка: %v", err)
+	}
+	data, err := os.ReadFile(cfg.EventsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"decoy_id":"api-export"`, `"decoy_id":"role-cookie"`, `"decoy_kind":"cookie"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("в файле событий нет %s", want)
+		}
+	}
+	if strings.Contains(string(data), "TAMPERED") {
+		t.Error("значение cookie попало в файл событий")
+	}
+}
+
 // TestRunFailsWhenEventsFileUnavailable: файл событий открыть нельзя —
 // сенсор не стартует и не открывает слушатели.
 func TestRunFailsWhenEventsFileUnavailable(t *testing.T) {

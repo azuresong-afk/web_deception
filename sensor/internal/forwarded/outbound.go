@@ -143,3 +143,23 @@ func isForwardingHeader(norm string) bool {
 		clientIPHeaders[norm] ||
 		pathOverrideHeaders[norm]
 }
+
+// HTTPS — пришёл ли запрос от клиента по HTTPS.
+//
+// По HTTPS — если TLS снял сам сенсор, или если доверенный прокси, снявший
+// TLS, сообщил об этом в X-Forwarded-Proto. Заголовок клиента не читается:
+// соединение не от доверенного прокси — значит, по нему и судим.
+//
+// При нескольких значениях берётся первое: его записал прокси, ближайший
+// к клиенту, — тот, кто и принимал соединение клиента.
+func HTTPS(in *http.Request, c Client) bool {
+	if in.TLS != nil {
+		return true
+	}
+	v := trustedValues(in, c, headerXFP)
+	if v == nil {
+		return false
+	}
+	first, _, _ := strings.Cut(v[0], ",")
+	return strings.EqualFold(strings.TrimSpace(first), "https")
+}

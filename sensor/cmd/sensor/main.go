@@ -379,7 +379,7 @@ func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.G
 			Kind: metrics.Counter, Value: guard.Stats.Aborted.Load},
 	)
 	ms = append(ms,
-		metrics.Metric{Name: "sensor_policy_traps", Help: "Ловушки в текущей политике.",
+		metrics.Metric{Name: "sensor_policy_traps", Help: "Ловушки в текущей политике, включая cookie-ловушки.",
 			Kind: metrics.Gauge, Value: func() uint64 { return uint64(max(detector.Current().Len(), 0)) }},
 		metrics.Metric{Name: "sensor_policy_loads_total", Help: "Загрузки политики: применена или отвергнута проверкой.",
 			Kind: metrics.Counter, Label: `result="loaded"`,
@@ -391,6 +391,12 @@ func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.G
 			Kind: metrics.Counter, Label: `mode="enforce"`, Value: detector.Stats.Enforced.Load},
 		metrics.Metric{Name: "sensor_decoy_touches_total", Help: "Касания ловушек по режиму: ответила ловушка или только записано.",
 			Kind: metrics.Counter, Label: `mode="observe"`, Value: detector.Stats.Observed.Load},
+		metrics.Metric{Name: "sensor_cookie_touches_total", Help: "Запросы с изменённой cookie-наживкой.",
+			Kind: metrics.Counter, Value: detector.Stats.CookieTouches.Load},
+		metrics.Metric{Name: "sensor_cookie_baits_total", Help: "Выданные cookie-наживки (Set-Cookie к ответу на переход по странице).",
+			Kind: metrics.Counter, Value: detector.Stats.CookieBaits.Load},
+		metrics.Metric{Name: "sensor_preflights_refused_total", Help: "Предварительные запросы CORS к ловушкам с preflight_only, которые сенсор не одобрил.",
+			Kind: metrics.Counter, Value: detector.Stats.PreflightsRefused.Load},
 	)
 	for _, c := range proxy.ErrorClasses() {
 		ms = append(ms, metrics.Metric{

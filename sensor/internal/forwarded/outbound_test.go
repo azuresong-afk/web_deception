@@ -170,3 +170,42 @@ func assertHeader(t *testing.T, h http.Header, name, want string) {
 		t.Errorf("%s = %q, ожидалось [%q]", name, got, want)
 	}
 }
+
+// TestHTTPS: о схеме судим по своему соединению или по заголовку
+// доверенного прокси, но не по заголовку клиента.
+func TestHTTPS(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		peer  string
+		tls   bool
+		proto []string
+		want  bool
+	}{
+		{"клиент по HTTP", clientIP + ":5555", false, nil, false},
+		{"клиент по HTTP выдаёт себя за HTTPS", clientIP + ":5555", false, []string{"https"}, false},
+		{"TLS снял сенсор", clientIP + ":5555", true, nil, true},
+		{"доверенный прокси: https", proxyNear + ":40000", false, []string{"https"}, true},
+		{"доверенный прокси: HTTPS в другом регистре", proxyNear + ":40000", false, []string{" HTTPS "}, true},
+		{"доверенный прокси: http", proxyNear + ":40000", false, []string{"http"}, false},
+		{"доверенный прокси: цепочка, первым http", proxyNear + ":40000", false, []string{"http, https"}, false},
+		{"доверенный прокси: цепочка, первым https", proxyNear + ":40000", false, []string{"https, http"}, true},
+		{"доверенный прокси без заголовка", proxyNear + ":40000", false, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			in := request(tc.peer)
+			if tc.tls {
+				in.TLS = &tls.ConnectionState{}
+			}
+			if tc.proto != nil {
+				in.Header["X-Forwarded-Proto"] = tc.proto
+			}
+			if got := HTTPS(in, testResolver(t).Resolve(in)); got != tc.want {
+				t.Errorf("HTTPS = %v, ожидалось %v", got, tc.want)
+			}
+		})
+	}
+}

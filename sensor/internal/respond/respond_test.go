@@ -3,6 +3,7 @@ package respond
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -59,5 +60,24 @@ func TestTrap(t *testing.T) {
 	Trap(rec, http.StatusOK, "text/html", "<script>")
 	if got := rec.Header().Get("Content-Type"); got != "application/octet-stream" {
 		t.Errorf("неизвестный тип отдан как %q", got)
+	}
+}
+
+// TestRefusePreflight: ни одного заголовка, который одобрил бы CORS.
+func TestRefusePreflight(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	RefusePreflight(rec)
+	if rec.Code != http.StatusNoContent || rec.Body.Len() != 0 {
+		t.Errorf("код %d, тело %d байт", rec.Code, rec.Body.Len())
+	}
+	for name := range rec.Header() {
+		if strings.HasPrefix(name, "Access-Control-") {
+			t.Errorf("в ответе заголовок CORS %s", name)
+		}
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" {
+		t.Error("нет Cache-Control: no-store")
 	}
 }
