@@ -359,9 +359,12 @@ func TestDemoPolicyValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("учебная политика не проходит проверку: %v", err)
 	}
-	for _, p := range []string{"/.env", "/.git/config", "/backup.sql"} {
+	for _, p := range []string{"/.env", "/.git/config", "/backup.sql", "/api/internal/v1/users/export"} {
 		if _, ok := c.Match(p); !ok {
 			t.Errorf("в учебной политике нет ловушки %s", p)
 		}
+	}
+	if _, ok := c.CookieByName("account_role"); !ok {
+		t.Error("в учебной политике нет cookie-ловушки account_role")
 	}
 }
