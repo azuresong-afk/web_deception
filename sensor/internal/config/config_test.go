@@ -62,6 +62,10 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.EventsFile != "/var/lib/sensor/events.jsonl" {
 		t.Errorf("EventsFile по умолчанию = %q", cfg.EventsFile)
 	}
+	// Без политики сенсор работает без ловушек; копия — в каталоге состояния.
+	if cfg.PolicyFile != "" || cfg.PolicyCacheFile != "/var/lib/sensor/policy.last-valid.json" {
+		t.Errorf("политика по умолчанию: %q, копия %q", cfg.PolicyFile, cfg.PolicyCacheFile)
+	}
 	// По умолчанию не доверяем никому: X-Forwarded-For не читается.
 	if len(cfg.TrustedProxies) != 0 {
 		t.Errorf("TrustedProxies по умолчанию = %v, ожидался пустой список", cfg.TrustedProxies)
@@ -179,6 +183,10 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		// Файл событий.
 		{"каталог вместо файла", map[string]string{"SENSOR_EVENTS_FILE": "/var/lib/sensor/"}, "каталог"},
 		{"нулевой байт в пути", map[string]string{"SENSOR_EVENTS_FILE": "/tmp/a\x00b"}, "нулевой байт"},
+		{"политика — каталог", map[string]string{"SENSOR_POLICY_FILE": "/etc/sensor/"}, "каталог"},
+		{"политика и копия в одном файле", map[string]string{
+			"SENSOR_POLICY_FILE": "/var/lib/sensor/p.json", "SENSOR_POLICY_CACHE_FILE": "/var/lib/sensor/p.json",
+		}, "совпадают"},
 
 		{"слишком много записей", map[string]string{"SENSOR_TRUSTED_PROXIES": strings.Repeat("10.0.0.1,", 1024) + "10.0.0.1"}, "не больше 1024"},
 	}

@@ -46,6 +46,10 @@ const (
 	// том, чтобы события переживали перезапуск контейнера.
 	defaultEventsFile = "/var/lib/sensor/events.jsonl"
 
+	// Копия последней валидной политики — в том же каталоге состояния
+	// сенсора, что и события: его пишет только сенсор (ADR-0025).
+	defaultPolicyCacheFile = "/var/lib/sensor/policy.last-valid.json"
+
 	// Клиентский слушатель, в отличие от служебного, по умолчанию открыт
 	// на всех интерфейсах: принимать трафик из сети — его работа. За ним
 	// нет ничего, что не было бы уже открыто самим приложением клиента.
@@ -112,6 +116,13 @@ type Config struct {
 	// EventsFile — файл событий в формате JSON Lines (ADR-0023). Рядом
 	// с ним появляются старые файлы после ротации: EventsFile.1 … .4.
 	EventsFile string
+
+	// PolicyFile — политика обнаружения (ADR-0025). Пусто — ловушек нет.
+	PolicyFile string
+
+	// PolicyCacheFile — копия последней валидной политики, которую ведёт
+	// сам сенсор: с ней он работает, если файл администратора сломан.
+	PolicyCacheFile string
 }
 
 // Getenv — источник переменных окружения.
@@ -133,6 +144,7 @@ func Load(getenv Getenv) (*Config, error) {
 		ShutdownTimeout: defaultShutdownTimeout,
 		LogLevel:        defaultLogLevel,
 		EventsFile:      defaultEventsFile,
+		PolicyCacheFile: defaultPolicyCacheFile,
 	}
 
 	// Адрес приложения обязателен. Значения по умолчанию нет намеренно:
@@ -202,12 +214,27 @@ func Load(getenv Getenv) (*Config, error) {
 		cfg.LogLevel = lvl
 	}
 
-	if v := strings.TrimSpace(getenv("SENSOR_EVENTS_FILE")); v != "" {
-		p, err := parseEventsFile(v)
-		if err != nil {
-			return nil, fmt.Errorf("SENSOR_EVENTS_FILE: %w", err)
+	for _, f := range []struct {
+		name string
+		dst  *string
+	}{
+		{"SENSOR_EVENTS_FILE", &cfg.EventsFile},
+		{"SENSOR_POLICY_FILE", &cfg.PolicyFile},
+		{"SENSOR_POLICY_CACHE_FILE", &cfg.PolicyCacheFile},
+	} {
+		if v := strings.TrimSpace(getenv(f.name)); v != "" {
+			p, err := parseFilePath(v)
+			if err != nil {
+				return nil, fmt.Errorf("%s: %w", f.name, err)
+			}
+			*f.dst = p
 		}
-		cfg.EventsFile = p
+	}
+
+	// Файл администратора и копия сенсора в одном месте — сенсор затирал бы
+	// файл администратора своими копиями.
+	if cfg.PolicyFile != "" && cfg.PolicyFile == cfg.PolicyCacheFile {
+		return nil, fmt.Errorf("SENSOR_POLICY_FILE и SENSOR_POLICY_CACHE_FILE совпадают (%s)", cfg.PolicyFile)
 	}
 
 	// Два слушателя на одном адресе — это не «один из них не запустится»,
@@ -263,12 +290,12 @@ func parseUpstream(raw string) (*url.URL, error) {
 	return &url.URL{Scheme: u.Scheme, Host: u.Host}, nil
 }
 
-// parseEventsFile проверяет путь к файлу событий.
+// parseFilePath проверяет путь к файлу: событий, политики, копии политики.
 //
-// Существование каталога и права здесь не проверяются: файл открывается
-// при запуске сенсора, и ошибка открытия остановит запуск с понятным
-// сообщением. Здесь — только то, что точно ошибка записи пути.
-func parseEventsFile(v string) (string, error) {
+// Существование каталога и права здесь не проверяются: файлы открываются
+// при запуске сенсора, и ошибка открытия видна там с понятным сообщением.
+// Здесь — только то, что точно ошибка записи пути.
+func parseFilePath(v string) (string, error) {
 	if strings.ContainsRune(v, 0) {
 		return "", fmt.Errorf("путь содержит нулевой байт")
 	}

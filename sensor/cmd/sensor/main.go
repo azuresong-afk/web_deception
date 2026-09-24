@@ -6,12 +6,12 @@
 //   - служебный — /healthz и /readyz для проверок живости, только на
 //     localhost по умолчанию (пакет admin).
 //
-// Обнаружение стоит внутри защиты fail-open (пакет failopen): его сбой или
-// перегрузка не ломают трафик. События (запуск, остановка, попытки CONNECT,
+// Обнаружение — ловушки из файла политики (пакеты policy и decoy) — стоит
+// внутри защиты fail-open (пакет failopen): его сбой или перегрузка
+// не ломают трафик. Политика перечитывается по SIGHUP. События (запуск, остановка, попытки CONNECT,
 // переходы в fail-open) пишутся в файл JSON Lines
 // через буфер, который никогда не задерживает трафик (пакет event),
 // счётчики — на служебном слушателе в /metrics (пакет metrics).
-// Приманок пока нет: они появятся на следующих шагах этапа 2.
 package main
 
 import (
@@ -30,6 +30,7 @@ import (
 
 	"github.com/azuresong-afk/web_deception/sensor/internal/admin"
 	"github.com/azuresong-afk/web_deception/sensor/internal/config"
+	"github.com/azuresong-afk/web_deception/sensor/internal/decoy"
 	"github.com/azuresong-afk/web_deception/sensor/internal/event"
 	"github.com/azuresong-afk/web_deception/sensor/internal/failopen"
 	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
@@ -106,6 +107,13 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// SIGHUP — «перечитай политику». Подписываемся сразу, до всего
+	// остального: по умолчанию Go при SIGHUP завершает процесс, и без этой
+	// строки команда перезагрузки политики уронила бы сенсор, а с ним сайт.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+
 	// Файл событий открываем первым, до слушателей. Не открылся — сенсор
 	// не стартует: сенсор, который пропускает трафик и молча ничего
 	// не записывает, создаёт ложное чувство защищённости. Это ошибка
@@ -124,16 +132,27 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	stats := &proxy.Stats{}
 	trust := forwarded.NewResolver(cfg.TrustedProxies)
 
-	// Обнаружения пока нет — приманки появятся на шаге 8. Guard уже стоит
-	// на своём месте: приманки встанут внутрь готовой защиты fail-open.
+	// Обнаружение — ловушки из политики (ADR-0025) — внутри защиты
+	// fail-open (ADR-0024). Политика загружается до открытия слушателей:
+	// первый же запрос проверяется по ней.
+	detector := decoy.New(events, trust)
+	var loader *decoy.Loader
+	if cfg.PolicyFile != "" {
+		loader = decoy.NewLoader(cfg.PolicyFile, cfg.PolicyCacheFile, detector, events, logger)
+		loader.Startup()
+	} else {
+		logger.Warn("политика обнаружения не задана (SENSOR_POLICY_FILE): сенсор работает без ловушек")
+	}
+	go reloadOnHUP(ctx, hup, loader, logger)
+
 	guard := failopen.NewGuard(failopen.Config{
-		Detector: failopen.NoDetector{},
+		Detector: detector,
 		Events:   events,
 		Trust:    trust,
 		Logger:   logger,
 	})
 
-	adminSrv := admin.NewServer(admin.NewHandler(&ready, metrics.Handler(sensorMetrics(events, stats, guard))), logger)
+	adminSrv := admin.NewServer(admin.NewHandler(&ready, metrics.Handler(sensorMetrics(events, stats, guard, detector, loader))), logger)
 	proxySrv := proxy.NewServer(proxy.NewHandler(cfg.Upstream, proxy.Options{
 		Trust:  trust,
 		Events: events,
@@ -265,6 +284,24 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	return nil
 }
 
+// reloadOnHUP перечитывает политику по каждому SIGHUP, пока сенсор работает.
+// Неверная политика не применяется: Loader оставляет прежнюю.
+func reloadOnHUP(ctx context.Context, hup <-chan os.Signal, loader *decoy.Loader, logger *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+			if loader == nil {
+				logger.Info("получен SIGHUP, но политика не задана (SENSOR_POLICY_FILE): перечитывать нечего")
+				continue
+			}
+			logger.Info("получен SIGHUP: перечитываем политику")
+			loader.Reload()
+		}
+	}
+}
+
 // eventsCloseTimeout — сколько при остановке ждать, пока допишутся события.
 // Отдельно от SENSOR_SHUTDOWN_TIMEOUT: тот к этому моменту может быть
 // израсходован на ожидание запросов клиентов.
@@ -283,7 +320,18 @@ func closeEvents(events *event.Recorder, logger *slog.Logger) {
 
 // sensorMetrics — список счётчиков для /metrics. Имена и метки — только
 // константы: ни одно значение из запроса не становится меткой.
-func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.Guard) []metrics.Metric {
+func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.Guard,
+	detector *decoy.Detector, loader *decoy.Loader) []metrics.Metric {
+	// Без SENSOR_POLICY_FILE загрузчика нет, и счётчики загрузок — нули.
+	loads := func(pick func(*decoy.LoaderStats) uint64) func() uint64 {
+		return func() uint64 {
+			if loader == nil {
+				return 0
+			}
+			return pick(&loader.Stats)
+		}
+	}
+
 	const droppedHelp = "События, отброшенные сенсором, по причине: буфер полон, ошибка записи, сенсор останавливается."
 	ms := []metrics.Metric{
 		{Name: "sensor_events_emitted_total", Help: "События, принятые в буфер.", Kind: metrics.Counter,
@@ -329,6 +377,20 @@ func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.G
 			Kind: metrics.Counter, Value: guard.Stats.Panics.Load},
 		metrics.Metric{Name: "sensor_detection_aborted_total", Help: "Запросы, оборванные после паники в обнаружении: ответ уже начат или тело прочитано.",
 			Kind: metrics.Counter, Value: guard.Stats.Aborted.Load},
+	)
+	ms = append(ms,
+		metrics.Metric{Name: "sensor_policy_traps", Help: "Ловушки в текущей политике.",
+			Kind: metrics.Gauge, Value: func() uint64 { return uint64(max(detector.Current().Len(), 0)) }},
+		metrics.Metric{Name: "sensor_policy_loads_total", Help: "Загрузки политики: применена или отвергнута проверкой.",
+			Kind: metrics.Counter, Label: `result="loaded"`,
+			Value: loads(func(s *decoy.LoaderStats) uint64 { return s.Loaded.Load() })},
+		metrics.Metric{Name: "sensor_policy_loads_total", Help: "Загрузки политики: применена или отвергнута проверкой.",
+			Kind: metrics.Counter, Label: `result="rejected"`,
+			Value: loads(func(s *decoy.LoaderStats) uint64 { return s.Rejected.Load() })},
+		metrics.Metric{Name: "sensor_decoy_touches_total", Help: "Касания ловушек по режиму: ответила ловушка или только записано.",
+			Kind: metrics.Counter, Label: `mode="enforce"`, Value: detector.Stats.Enforced.Load},
+		metrics.Metric{Name: "sensor_decoy_touches_total", Help: "Касания ловушек по режиму: ответила ловушка или только записано.",
+			Kind: metrics.Counter, Label: `mode="observe"`, Value: detector.Stats.Observed.Load},
 	)
 	for _, c := range proxy.ErrorClasses() {
 		ms = append(ms, metrics.Metric{

@@ -59,6 +59,13 @@ const (
 	// TypeDetectionPanic — паника в обнаружении на этом запросе; запрос
 	// ушёл в приложение без проверки.
 	TypeDetectionPanic Type = "detection.panic"
+	// TypeDecoyTouch — касание ловушки (ADR-0025).
+	TypeDecoyTouch Type = "decoy.touch"
+	// TypePolicyLoaded — политика обнаружения применена.
+	TypePolicyLoaded Type = "sensor.policy_loaded"
+	// TypePolicyRejected — политика не прошла проверку; сенсор остался
+	// на прежней.
+	TypePolicyRejected Type = "sensor.policy_rejected"
 )
 
 // Severity — важность события.

@@ -85,8 +85,10 @@ Web-deception встраивает в защищаемое веб-приложе
 ([ADR-0021](adr/0021-proxy-transparency.md)): принимает запросы на клиентском
 слушателе и передаёт их приложению, адрес которого задан в конфигурации;
 ответ приложения возвращает клиенту без изменений. Записывает события
-([ADR-0023](adr/0023-sensor-events.md)): запуск, остановку и попытки
-`CONNECT`. Приманок пока нет — они появятся на шаге 8.
+([ADR-0023](adr/0023-sensor-events.md)): запуск, остановку, попытки
+`CONNECT`, касания ловушек. Ловушки задаются файлом политики
+([ADR-0025](adr/0025-policy-format.md)); в демо-стенде их три — учебные
+`/.env`, `/.git/config`, `/backup.sql`.
 
 Что сенсор при этом делает сам:
 
@@ -136,6 +138,8 @@ Web-deception встраивает в защищаемое веб-приложе
 | `SENSOR_SHUTDOWN_TIMEOUT` | `10s` | сколько ждать активные запросы при остановке, до 60s |
 | `SENSOR_LOG_LEVEL` | `info` | debug, info, warn, error |
 | `SENSOR_EVENTS_FILE` | `/var/lib/sensor/events.jsonl` | файл событий; каталог должен существовать и принадлежать пользователю сенсора; не открылся — сенсор не стартует |
+| `SENSOR_POLICY_FILE` | пусто — без ловушек | файл политики обнаружения; ошибка в нём не мешает запуску |
+| `SENSOR_POLICY_CACHE_FILE` | `/var/lib/sensor/policy.last-valid.json` | копия последней валидной политики, которую ведёт сам сенсор |
 
 **Как настраивается.** Настройки делятся на два слоя
 ([ADR-0018](adr/0018-policy-as-data.md)):
@@ -148,7 +152,28 @@ Web-deception встраивает в защищаемое веб-приложе
   собственные правила. JSON-документ: на этапе 2 — файл, с этапа 3 —
   от control plane с подписью, с этапа 5 — редактируется в веб-интерфейсе.
 
-Сейчас у сенсора есть только слой запуска.
+Политика на этапе 2 — локальный файл, раздача с control plane — этап 3.
+
+**Политика и ловушки.** Ловушка — точный путь, запрос к которому делают
+только атакующие и сканеры. Касание записывается событием `decoy.touch`
+с адресом клиента, а дальше — по режиму правила:
+
+- `enforce` — сенсор отвечает вместо приложения ответом из политики
+  (фейковый `.env`, конфигурация git, «резервная копия»);
+- `observe` — только записывает, запрос идёт в приложение. Новое правило
+  сначала ставьте так: по событиям видно, не трогают ли путь обычные
+  пользователи.
+
+Путь сравнивается после нормализации: `//.env`, `/./.env`, `/.env;x`,
+`/%2eenv` ловятся как `/.env`. В приложение уходит исходный путь.
+
+Как изменить политику в демо-стенде: правка `deploy/policy/demo.json`,
+затем `make policy-reload`. Сенсор проверяет её строго — неизвестные поля,
+повторяющиеся ключи, ловушку на `/`, HTML в ответе, перенаправления
+отвергает — и при ошибке остаётся на прежней: событие
+`sensor.policy_rejected` с текстом ошибки. Копию последней валидной сенсор
+хранит сам, и ловушки не пропадают даже при перезапуске со сломанным файлом.
+Формат — в ADR-0025.
 
 **За балансировщиком или CDN.** Задайте в `SENSOR_TRUSTED_PROXIES` адреса
 именно своих прокси, а не всю внутреннюю сеть: любой узел в доверенной
@@ -183,6 +208,10 @@ Web-deception встраивает в защищаемое веб-приложе
 `sensor_fail_open` = 1 — обнаружение перегружено и проверяет каждый 10-й
 запрос; рост `sensor_detection_panics_total` — ошибка в обнаружении,
 стек — в логе, кто вызвал — в событиях `detection.panic`.
+`sensor_policy_traps` — сколько ловушек в текущей политике;
+`sensor_policy_loads_total{result="rejected"}` растёт — политика не принята,
+текст ошибки в событии `sensor.policy_rejected`; `sensor_decoy_touches_total` —
+касания по режиму.
 
 **Где код и в каком порядке читать:**
 
@@ -197,14 +226,19 @@ sensor/internal/proxy/limit.go           7. предел соединений
 sensor/internal/proxy/server.go          8. таймауты клиентских соединений
 sensor/internal/failopen/guard.go       9. fail-open: паника и перегрузка в обнаружении
 sensor/internal/failopen/mode.go       10. частичное обнаружение и гистерезис
-sensor/internal/event/event.go         11. формат события, что берётся из запроса
-sensor/internal/event/mask.go          12. маскирование пути
-sensor/internal/event/recorder.go      13. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
-sensor/internal/event/file.go          14. файл событий и ротация
-sensor/internal/metrics/metrics.go     15. /metrics в формате Prometheus
-sensor/internal/admin/server.go        16. служебный слушатель: фильтр путей, таймауты
-sensor/internal/respond/respond.go     17. единственный способ ответить самому
-deploy/docker/sensor.Dockerfile        18. как собирается образ, каталог событий
+sensor/internal/policy/policy.go       11. формат политики, строгая проверка, нормализация пути
+sensor/internal/policy/file.go         12. чтение политики, атомарная копия последней валидной
+sensor/internal/decoy/decoy.go         13. касание ловушки: событие и ответ
+sensor/internal/decoy/loader.go        14. загрузка, откат на последнюю валидную, SIGHUP
+sensor/internal/event/event.go         15. формат события, что берётся из запроса
+sensor/internal/event/mask.go          16. маскирование пути
+sensor/internal/event/recorder.go      17. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
+sensor/internal/event/file.go          18. файл событий и ротация
+sensor/internal/metrics/metrics.go     19. /metrics в формате Prometheus
+sensor/internal/admin/server.go        20. служебный слушатель: фильтр путей, таймауты
+sensor/internal/respond/respond.go     21. ответы сенсора: нейтральные и ответ ловушки
+deploy/docker/sensor.Dockerfile        22. как собирается образ, каталог событий
+deploy/policy/demo.json                23. учебная политика: три ловушки
 ```
 
 **Граница доверия.** Всё, что приходит по HTTP, враждебно: путь, метод,
@@ -225,7 +259,9 @@ deploy/docker/sensor.Dockerfile        18. как собирается обра�
 make dev-demo                                     # Juice Shop за сенсором
 curl -s http://127.0.0.1:8080/ | grep -o '<title>[^<]*'   # OWASP Juice Shop
 curl -s -o /dev/null -w '%{http_code}\n' -X CONNECT --request-target 10.0.0.1:22 http://127.0.0.1:8080   # 405
-make dev-events                                   # sensor.started и request.connect_rejected
+curl -s http://127.0.0.1:8080/.env                # фейковый .env от ловушки
+curl -s http://127.0.0.1:8080//./.env             # то же: путь нормализуется
+make dev-events                                   # sensor.started, request.connect_rejected, decoy.touch
 curl -s http://127.0.0.1:3000/                    # не отвечает: только через сенсор
 make dev-logs                                     # "сенсор запущен", upstream
 make dev-down
@@ -242,7 +278,8 @@ curl -s http://127.0.0.1:9090/metrics
 [ADR-0021](adr/0021-proxy-transparency.md) — что прокси меняет, что нет, и таймауты,
 [ADR-0022](adr/0022-client-ip-trusted-proxies.md) — адрес клиента и доверенные прокси,
 [ADR-0023](adr/0023-sensor-events.md) — события: формат, буфер, файл, метрики,
-[ADR-0024](adr/0024-fail-open.md) — fail-open: паника и перегрузка в обнаружении.
+[ADR-0024](adr/0024-fail-open.md) — fail-open: паника и перегрузка в обнаружении,
+[ADR-0025](adr/0025-policy-format.md) — политика: формат, проверка, загрузка, ловушки.
 **Угрозы:** T1, T2, T3, T4, T5, T7, T17, T18, T19 в [модели угроз](threat-model.md).
 
 ---
@@ -335,6 +372,7 @@ make dev-vulnbank # то же плюс VulnBank за сенсором на 127.0
 make dev-ps       # состояние и проверки здоровья
 make dev-logs     # логи всех сервисов
 make dev-events   # события сенсора перед Juice Shop
+make policy-reload # перечитать deploy/policy/demo.json в запущенных сенсорах
 make dev-down     # остановить (данные базы и события сохраняются)
 make dev-reset    # остановить и удалить данные базы и события
 ```
@@ -453,7 +491,7 @@ Workflow `.github/workflows/ci.yml` запускается на каждый PR 
 |---|---|
 | `make lint` | golangci-lint для Go (включая gosec), ruff и mypy для Python, политику контейнеров, actionlint для workflow |
 | `make test` | тесты Go с детектором гонок, тесты Python, тесты скриптов, пороги покрытия |
-| `make smoke` | поднимает стек с Juice Shop и VulnBank за сенсорами, проверяет готовность, что запросы через сенсоры доходят до приложений и что попытка `CONNECT` записана в файл событий внутри контейнера, отсутствие shell в образах, останавливает |
+| `make smoke` | поднимает стек с Juice Shop и VulnBank за сенсорами, проверяет готовность, что запросы через сенсоры доходят до приложений, что попытка `CONNECT` и касание ловушки записаны в файл событий внутри контейнера, что ловушки отвечают вместо приложений, отсутствие shell в образах, останавливает |
 | `make check-images` | в собранных образах продукта не запускаются `sh`, `bash`, `perl`, `apt-get`, `pip`, `curl`, `wget` |
 | `make hooks` | включает git-хуки в этом клоне — один раз |
 | `make test-hooks` | проверяет хуки настоящими коммитами во временном репозитории |

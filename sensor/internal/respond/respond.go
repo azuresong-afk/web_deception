@@ -34,3 +34,40 @@ func Plain(w http.ResponseWriter, status int, body string) {
 	// наш лог до размера диска.
 	_, _ = io.WriteString(w, body+"\n")
 }
+
+// TrapContentTypes — типы содержимого, которые может отдавать ловушка,
+// и заголовок Content-Type для каждого. Политика с другим типом
+// не принимается (пакет policy).
+//
+// text/html здесь нет намеренно: HTML из политики — это готовый способ
+// внедрить скрипт в сайт клиента (угроза T15). Наживки в HTML появятся
+// на шаге 10 только через шаблоны с экранированием.
+var TrapContentTypes = map[string]string{
+	"text/plain":               "text/plain; charset=utf-8",
+	"application/json":         "application/json",
+	"application/octet-stream": "application/octet-stream",
+}
+
+// Trap — ответ ловушки: сенсор отвечает вместо приложения тем, что задано
+// в политике.
+//
+// В отличие от Plain, этот ответ изображает приложение, а не сенсор. Но три
+// заголовка — не из политики, а отсюда, для любой ловушки:
+//   - Content-Type — только из TrapContentTypes; неизвестный тип (его
+//     не пропустила бы проверка политики) заменяется на octet-stream;
+//   - X-Content-Type-Options: nosniff — браузер не угадает в тексте ловушки
+//     HTML и не выполнит его;
+//   - Cache-Control: no-store — CDN или прокси перед сенсором не закэширует
+//     ответ: иначе следующие касания получал бы кэш, и сенсор их не видел бы.
+func Trap(w http.ResponseWriter, status int, contentType, body string) {
+	ct, ok := TrapContentTypes[contentType]
+	if !ok {
+		ct = "application/octet-stream"
+	}
+	h := w.Header()
+	h.Set("Content-Type", ct)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, body)
+}
