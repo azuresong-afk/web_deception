@@ -156,8 +156,13 @@ build: ## Собрать бинарник сенсора в bin/
 		-o ../$(BIN_DIR)/sensor ./cmd/sensor
 	@echo "Собрано: $(BIN_DIR)/sensor (версия $(VERSION))"
 
-run-sensor: ## Запустить сенсор на 127.0.0.1:9090
-	cd $(SENSOR_DIR) && $(GO) run ./cmd/sensor
+# Адрес приложения для make run-sensor. Сенсор без него не стартует:
+# значения по умолчанию в самом сенсоре нет намеренно (ADR-0021).
+SENSOR_UPSTREAM_URL ?= http://127.0.0.1:3000
+
+run-sensor: ## Запустить сенсор: 127.0.0.1:8080 → SENSOR_UPSTREAM_URL, служебный 127.0.0.1:9090
+	cd $(SENSOR_DIR) && SENSOR_LISTEN_ADDR=127.0.0.1:8080 SENSOR_UPSTREAM_URL=$(SENSOR_UPSTREAM_URL) \
+		$(GO) run ./cmd/sensor
 
 run-cp: ## Запустить control plane на 127.0.0.1:8000
 	cd $(CP_DIR) && PYTHONPATH=src $(UV) run python -m webdeception_cp
@@ -240,8 +245,10 @@ security-images:
 secrets: ## Создать локальные секреты (существующие не перезаписываются)
 	@sh scripts/gen-secrets.sh
 
+# Профиль demo нужен и здесь: сенсор объявлен в нём вместе с учебной целью,
+# и без профиля compose его образ не собрал бы.
 images: ## Собрать образы сенсора и control plane
-	VERSION=$(VERSION) $(COMPOSE) build
+	VERSION=$(VERSION) $(COMPOSE) --profile demo build
 
 # Образы продукта без shell и утилит (ADR-0020). Правило D6 в make lint
 # проверяет Dockerfile; эта проверка — то, что на самом деле оказалось
@@ -266,17 +273,22 @@ check-images: ## Убедиться, что в собранных образах
 	done
 	@echo "==> в образах продукта нет shell, perl, apt, pip, curl и wget"
 
-smoke: ## Поднять стек, убедиться в готовности, остановить и удалить данные
-	$(MAKE) dev
+# Сквозная проверка: запрос к сенсору доходит до Juice Shop, и клиент получает
+# его страницу. Это единственная проверка, что сенсор работает как прокси
+# в настоящем стеке, с нашими ограничениями контейнеров и сетей.
+smoke: ## Поднять стек с Juice Shop за сенсором, проверить путь запроса, остановить
+	$(MAKE) dev-demo
 	curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8000/readyz
+	curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8080/ | grep -q "OWASP Juice Shop"
+	@echo "==> запрос через сенсор дошёл до Juice Shop"
 	$(MAKE) check-images
 	$(MAKE) dev-reset
 
-dev: secrets ## Поднять весь стек и дождаться готовности всех сервисов
+dev: secrets ## Поднять control plane, PostgreSQL и NATS и дождаться готовности
 	VERSION=$(VERSION) $(COMPOSE) up --build --detach --wait
 	@$(COMPOSE) ps
 
-dev-demo: secrets ## То же плюс OWASP Juice Shop на 127.0.0.1:3000
+dev-demo: secrets ## То же плюс OWASP Juice Shop за сенсором на 127.0.0.1:8080
 	VERSION=$(VERSION) $(COMPOSE) --profile demo up --build --detach --wait
 	@$(COMPOSE) --profile demo ps
 
