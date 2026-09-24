@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/azuresong-afk/web_deception/sensor/internal/event"
+	"github.com/azuresong-afk/web_deception/sensor/internal/failopen"
 	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 )
 
@@ -171,7 +172,11 @@ func (m *memEvents) all() []event.Event {
 }
 
 func testOptions(trust *forwarded.Resolver, logger *slog.Logger) Options {
-	return Options{Trust: trust, Events: &memEvents{}, Stats: &Stats{}, Logger: logger}
+	events := &memEvents{}
+	guard := failopen.NewGuard(failopen.Config{
+		Detector: failopen.NoDetector{}, Events: events, Trust: trust, Logger: logger,
+	})
+	return Options{Trust: trust, Events: events, Guard: guard, Stats: &Stats{}, Logger: logger}
 }
 
 // --- прозрачность --------------------------------------------------------------
@@ -437,6 +442,44 @@ func TestTrustedProxyChain(t *testing.T) {
 	}
 	if vals := got.Values("X_Forwarded_Proto"); len(vals) != 0 {
 		t.Errorf("вариант с подчёркиванием дошёл до приложения: %q", vals)
+	}
+}
+
+// panicDetector падает на каждом запросе.
+type panicDetector struct{}
+
+func (panicDetector) Inspect(http.ResponseWriter, *http.Request) bool {
+	panic("сбой обнаружения")
+}
+
+// TestFailOpenKeepsProtections: обнаружение падает на каждом запросе,
+// а сайт работает — запросы доходят до приложения. Защита при этом
+// не отключается: CONNECT по-прежнему 405, заголовки клиента по-прежнему
+// вычищены. Fail-open отключает обнаружение, но не защиту.
+func TestFailOpenKeepsProtections(t *testing.T) {
+	t.Parallel()
+
+	opts := testOptions(noTrust, discardLogger())
+	opts.Guard = failopen.NewGuard(failopen.Config{
+		Detector: panicDetector{}, Events: opts.Events, Trust: noTrust, Logger: discardLogger(),
+	})
+	app := newFakeApp(t, nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), opts), nil)
+
+	code, body := rawRequest(t, addr, "GET /page HTTP/1.1\r\nHost: x\r\nX-Real-IP: 1.2.3.4\r\n\r\n")
+	if code != http.StatusOK || app.calls.Load() != 1 {
+		t.Fatalf("при падающем обнаружении: код %d %q, приложение вызвано %d раз", code, body, app.calls.Load())
+	}
+	// Тест проверяет, что заголовок удалён, а не доверяет его значению.
+	// nosemgrep: go-untrusted-forwarded-headers
+	if v := app.lastRequest(t).Header.Get("X-Real-Ip"); v != "" {
+		t.Errorf("заголовок клиента дошёл до приложения при fail-open: %q", v)
+	}
+	if code, _ := rawRequest(t, addr, "CONNECT 10.0.0.1:22 HTTP/1.1\r\nHost: 10.0.0.1:22\r\n\r\n"); code != http.StatusMethodNotAllowed {
+		t.Errorf("CONNECT при fail-open получил %d, ожидался 405", code)
+	}
+	if n := opts.Guard.Stats.Panics.Load(); n != 1 {
+		t.Errorf("паник %d, ожидалась 1: CONNECT не должен доходить до обнаружения", n)
 	}
 }
 

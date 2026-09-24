@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/azuresong-afk/web_deception/sensor/internal/event"
+	"github.com/azuresong-afk/web_deception/sensor/internal/failopen"
 	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 	"github.com/azuresong-afk/web_deception/sensor/internal/respond"
 )
@@ -76,6 +77,10 @@ type Options struct {
 	Trust *forwarded.Resolver
 	// Events получает события; не ждёт (ADR-0023).
 	Events event.Emitter
+	// Guard запускает обнаружение под защитой fail-open (ADR-0024).
+	// Обнаружение — внутри Guard, защита (запрет CONNECT, заголовки
+	// о клиенте, адрес приложения) — снаружи: fail-open её не отключает.
+	Guard *failopen.Guard
 	// Stats — счётчики для /metrics.
 	Stats  *Stats
 	Logger *slog.Logger
@@ -152,7 +157,7 @@ func NewHandler(upstream *url.URL, o Options) http.Handler {
 func newHandler(upstream *url.URL, o Options, transport http.RoundTripper, idle time.Duration) http.Handler {
 	// Пропущенное поле — ошибка программиста. Падаем при запуске, а не
 	// на первом запросе клиента.
-	if o.Trust == nil || o.Events == nil || o.Stats == nil || o.Logger == nil {
+	if o.Trust == nil || o.Events == nil || o.Guard == nil || o.Stats == nil || o.Logger == nil {
 		panic("proxy: в Options не заданы все поля")
 	}
 	rp := &httputil.ReverseProxy{
@@ -194,7 +199,12 @@ func newHandler(upstream *url.URL, o Options, transport http.RoundTripper, idle 
 		ErrorLog: slog.NewLogLogger(o.Logger.Handler(), slog.LevelWarn),
 	}
 
-	return rejectConnect(o, withIOIdleDeadlines(rp, idle))
+	// Порядок обёрток — снаружи внутрь:
+	//   rejectConnect — защита, работает всегда, до всего остального;
+	//   сроки простоя — и для обнаружения, если оно читает тело, и для прокси;
+	//   Guard — обнаружение; упало или перегружено — запрос идёт дальше;
+	//   ReverseProxy — приложение.
+	return rejectConnect(o, withIOIdleDeadlines(o.Guard.Handler(rp), idle))
 }
 
 // newTransport — клиент HTTP, которым сенсор ходит в приложение.

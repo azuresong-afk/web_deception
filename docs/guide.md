@@ -108,7 +108,15 @@ Web-deception встраивает в защищаемое веб-приложе
 - записывает события без ожидания: событие кладётся в буфер на 4096
   событий, отдельная горутина пишет их в файл. Буфер полон — вытесняется
   самое старое, потеря учитывается в счётчике. Запрос клиента никогда
-  не ждёт диск.
+  не ждёт диск;
+- работает в режиме fail-open ([ADR-0024](adr/0024-fail-open.md)):
+  обнаружение (приманки с шага 8) стоит внутри защиты. Паника
+  в обнаружении — этот запрос уходит в приложение без проверки,
+  а паника записывается событием с адресом клиента. Перегрузка
+  (≥10% проверок дольше 5 мс) — проверяется каждый 10-й запрос, пока
+  нагрузка не спадёт; каждый переход — событие critical, строка ERROR
+  и метрика `sensor_fail_open`. Защиту — запрет `CONNECT`, чистку
+  заголовков, адрес приложения — fail-open не отключает никогда.
 
 Кроме того: служебный слушатель на `127.0.0.1:9090` с `/healthz`, `/readyz`
 и `/metrics`,
@@ -170,8 +178,11 @@ Web-deception встраивает в защищаемое веб-приложе
 `sensor_upstream_errors_total` (отказы приложения по классу),
 `sensor_connections_saturated_total` (упёрлись в предел соединений),
 `sensor_client_chain_broken_total` (прокси присылает неразбираемый
-`X-Forwarded-For` — ошибка его настройки). Полный список — в ADR-0023.
+`X-Forwarded-For` — ошибка его настройки). Полный список — в ADR-0023 и ADR-0024.
 Рост `sensor_events_dropped_total` — повод проверить диск.
+`sensor_fail_open` = 1 — обнаружение перегружено и проверяет каждый 10-й
+запрос; рост `sensor_detection_panics_total` — ошибка в обнаружении,
+стек — в логе, кто вызвал — в событиях `detection.panic`.
 
 **Где код и в каком порядке читать:**
 
@@ -184,14 +195,16 @@ sensor/internal/forwarded/outbound.go    5. какие заголовки о к�
 sensor/internal/proxy/deadline.go        6. сроки простоя тела запроса и ответа
 sensor/internal/proxy/limit.go           7. предел соединений
 sensor/internal/proxy/server.go          8. таймауты клиентских соединений
-sensor/internal/event/event.go          9. формат события, что берётся из запроса
-sensor/internal/event/mask.go          10. маскирование пути
-sensor/internal/event/recorder.go      11. буфер: никогда не ждать, вытеснять старое
-sensor/internal/event/file.go          12. файл событий и ротация
-sensor/internal/metrics/metrics.go     13. /metrics в формате Prometheus
-sensor/internal/admin/server.go        14. служебный слушатель: фильтр путей, таймауты
-sensor/internal/respond/respond.go     15. единственный способ ответить самому
-deploy/docker/sensor.Dockerfile        16. как собирается образ, каталог событий
+sensor/internal/failopen/guard.go       9. fail-open: паника и перегрузка в обнаружении
+sensor/internal/failopen/mode.go       10. частичное обнаружение и гистерезис
+sensor/internal/event/event.go         11. формат события, что берётся из запроса
+sensor/internal/event/mask.go          12. маскирование пути
+sensor/internal/event/recorder.go      13. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
+sensor/internal/event/file.go          14. файл событий и ротация
+sensor/internal/metrics/metrics.go     15. /metrics в формате Prometheus
+sensor/internal/admin/server.go        16. служебный слушатель: фильтр путей, таймауты
+sensor/internal/respond/respond.go     17. единственный способ ответить самому
+deploy/docker/sensor.Dockerfile        18. как собирается образ, каталог событий
 ```
 
 **Граница доверия.** Всё, что приходит по HTTP, враждебно: путь, метод,
@@ -228,7 +241,8 @@ curl -s http://127.0.0.1:9090/metrics
 [ADR-0018](adr/0018-policy-as-data.md) — два слоя настроек и правила из веб-интерфейса,
 [ADR-0021](adr/0021-proxy-transparency.md) — что прокси меняет, что нет, и таймауты,
 [ADR-0022](adr/0022-client-ip-trusted-proxies.md) — адрес клиента и доверенные прокси,
-[ADR-0023](adr/0023-sensor-events.md) — события: формат, буфер, файл, метрики.
+[ADR-0023](adr/0023-sensor-events.md) — события: формат, буфер, файл, метрики,
+[ADR-0024](adr/0024-fail-open.md) — fail-open: паника и перегрузка в обнаружении.
 **Угрозы:** T1, T2, T3, T4, T5, T7, T17, T18, T19 в [модели угроз](threat-model.md).
 
 ---

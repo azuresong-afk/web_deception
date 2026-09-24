@@ -3,7 +3,9 @@ package event
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +19,11 @@ import (
 // 4096 событий — несколько секунд задержки диска при таком потоке;
 // в памяти это порядка мегабайта.
 const QueueSize = 4096
+
+// PriorityQueueSize — ёмкость отдельного буфера для событий о состоянии
+// сенсора (типы sensor.*): запуск, остановка, переход в fail-open. Таких
+// событий единицы в час, 64 места — с большим запасом.
+const PriorityQueueSize = 64
 
 // dropLogInterval — не чаще одного сообщения о потерях в минуту: иначе
 // атака, переполняющая буфер, заодно заполнила бы лог.
@@ -67,7 +74,12 @@ type Stats struct {
 // записано, либо попало ровно в один счётчик потерь.
 type Recorder struct {
 	queue chan Event
-	sink  Sink
+	// prio — отдельный буфер для событий о состоянии сенсора (ADR-0024).
+	// Поток касаний приманок заполняет queue и вытесняет из неё старые
+	// события; если бы событие о переходе в fail-open лежало там же, его
+	// вытеснил бы этот поток — а это как раз момент, когда оно важнее всего.
+	prio chan Event
+	sink Sink
 
 	// mu защищает stopped. Emit держит его на чтение на время нескольких
 	// неблокирующих операций, Close — на запись один раз при остановке.
@@ -98,6 +110,7 @@ type Recorder struct {
 func NewRecorder(sink Sink, queueSize int, logger *slog.Logger) *Recorder {
 	r := &Recorder{
 		queue:  make(chan Event, queueSize),
+		prio:   make(chan Event, PriorityQueueSize),
 		sink:   sink,
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
@@ -117,10 +130,15 @@ func (r *Recorder) Emit(ev Event) {
 		return
 	}
 
+	q := r.queue
+	if isPriority(ev.Type) {
+		q = r.prio
+	}
+
 	// select с default — неблокирующая запись: если места в канале нет,
 	// выполняется default, а не ожидание.
 	select {
-	case r.queue <- ev:
+	case q <- ev:
 		r.Stats.Emitted.Add(1)
 		return
 	default:
@@ -131,7 +149,7 @@ func (r *Recorder) Emit(ev Event) {
 	// приманок; если бы терялись новые события, его следующие действия
 	// не записались бы вовсе. Так в буфере всегда самые свежие.
 	select {
-	case <-r.queue:
+	case <-q:
 		r.Stats.DroppedQueueFull.Add(1)
 	default:
 		// Горутина записи успела забрать событие — место уже есть.
@@ -139,11 +157,19 @@ func (r *Recorder) Emit(ev Event) {
 	// Вторая попытка — последняя. Освободившееся место мог занять другой
 	// обработчик; тогда теряется это событие, но ожидания и цикла нет.
 	select {
-	case r.queue <- ev:
+	case q <- ev:
 		r.Stats.Emitted.Add(1)
 	default:
 		r.Stats.DroppedQueueFull.Add(1)
 	}
+}
+
+// isPriority — событие о состоянии сенсора. Решает тип, а не важность:
+// тип — константа из кода, и события, которые может вызвать атакующий
+// (request.*, detection.*, касания приманок), в приоритетный буфер
+// не попадут никогда, сколько бы их ни было.
+func isPriority(t Type) bool {
+	return strings.HasPrefix(string(t), "sensor.")
 }
 
 // QueueLen — сколько событий ждут записи. uint64 — тип значений метрик.
@@ -186,33 +212,70 @@ func (r *Recorder) Close(ctx context.Context) error {
 func (r *Recorder) run() {
 	defer close(r.done)
 	for {
+		// Сначала — события о состоянии сенсора, если они есть. select
+		// с несколькими готовыми ветками выбирает случайную, поэтому
+		// приоритет — отдельной неблокирующей проверкой перед общим select.
 		select {
+		case ev := <-r.prio:
+			r.write(ev)
+			r.flushIfIdle()
+			continue
+		default:
+		}
+
+		select {
+		case ev := <-r.prio:
+			r.write(ev)
 		case ev := <-r.queue:
 			r.write(ev)
-			// Сбрасываем буфер файла, когда очередь опустела: при редких
-			// событиях каждое сразу видно в файле, при потоке — пишутся
-			// пачками, а буфер файла сбрасывается сам по заполнении.
-			if len(r.queue) == 0 {
-				r.flush()
-			}
 		case <-r.stop:
-			// Дописываем то, что уже в буфере, и выходим. Новые события
-			// Emit уже не принимает.
-			for {
-				select {
-				case ev := <-r.queue:
-					r.write(ev)
-				default:
-					r.flush()
-					r.closeErr = r.sink.Close()
-					return
-				}
-			}
+			// Дописываем то, что уже в буферах, — сначала приоритетный —
+			// и выходим. Новые события Emit уже не принимает.
+			r.drain(r.prio)
+			r.drain(r.queue)
+			r.flush()
+			r.closeErr = r.sink.Close()
+			return
+		}
+		r.flushIfIdle()
+	}
+}
+
+// flushIfIdle сбрасывает буфер файла, когда обе очереди опустели: при редких
+// событиях каждое сразу видно в файле, при потоке — пишутся пачками,
+// а буфер файла сбрасывается сам по заполнении.
+func (r *Recorder) flushIfIdle() {
+	if len(r.prio) == 0 && len(r.queue) == 0 {
+		r.flush()
+	}
+}
+
+func (r *Recorder) drain(q chan Event) {
+	for {
+		select {
+		case ev := <-q:
+			r.write(ev)
+		default:
+			return
 		}
 	}
 }
 
+// write кодирует и записывает одно событие.
+//
+// Паника здесь — ошибка в нашем коде записи — не должна уронить процесс:
+// горутина записи не обработчик запроса, и сервер Go её панику
+// не перехватит. Упавший сенсор — это упавший сайт клиента. Поэтому
+// паника перехватывается, событие считается потерянным, запись
+// продолжается со следующего.
 func (r *Recorder) write(ev Event) {
+	defer func() {
+		if p := recover(); p != nil {
+			r.Stats.DroppedWriteError.Add(1)
+			r.sinkError(fmt.Errorf("паника при записи события: %T", p))
+		}
+	}()
+
 	// json.Marshal экранирует в строках переводы строк, управляющие символы
 	// и <, >, & и заменяет недопустимый UTF-8. Поэтому строка события
 	// никогда не содержит перевода строки внутри: одна строка — одно

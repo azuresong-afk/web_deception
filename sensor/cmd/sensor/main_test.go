@@ -182,6 +182,9 @@ func TestRunRecordsEventsAndMetrics(t *testing.T) {
 	for _, want := range []string{
 		"sensor_connect_rejected_total 1\n",
 		"sensor_events_queue_capacity 4096\n",
+		"sensor_fail_open 0\n",
+		// Запрос CONNECT до обнаружения не доходит: защита стоит раньше.
+		"sensor_detection_inspected_total 0\n",
 		`sensor_upstream_errors_total{class="upstream_unreachable"} 0` + "\n",
 	} {
 		if code != http.StatusOK || !strings.Contains(body, want) {

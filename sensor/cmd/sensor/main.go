@@ -6,7 +6,9 @@
 //   - служебный — /healthz и /readyz для проверок живости, только на
 //     localhost по умолчанию (пакет admin).
 //
-// События (запуск, остановка, попытки CONNECT) пишутся в файл JSON Lines
+// Обнаружение стоит внутри защиты fail-open (пакет failopen): его сбой или
+// перегрузка не ломают трафик. События (запуск, остановка, попытки CONNECT,
+// переходы в fail-open) пишутся в файл JSON Lines
 // через буфер, который никогда не задерживает трафик (пакет event),
 // счётчики — на служебном слушателе в /metrics (пакет metrics).
 // Приманок пока нет: они появятся на следующих шагах этапа 2.
@@ -29,6 +31,7 @@ import (
 	"github.com/azuresong-afk/web_deception/sensor/internal/admin"
 	"github.com/azuresong-afk/web_deception/sensor/internal/config"
 	"github.com/azuresong-afk/web_deception/sensor/internal/event"
+	"github.com/azuresong-afk/web_deception/sensor/internal/failopen"
 	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 	"github.com/azuresong-afk/web_deception/sensor/internal/healthcheck"
 	"github.com/azuresong-afk/web_deception/sensor/internal/metrics"
@@ -119,11 +122,22 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 
 	var ready atomic.Bool
 	stats := &proxy.Stats{}
+	trust := forwarded.NewResolver(cfg.TrustedProxies)
 
-	adminSrv := admin.NewServer(admin.NewHandler(&ready, metrics.Handler(sensorMetrics(events, stats))), logger)
+	// Обнаружения пока нет — приманки появятся на шаге 8. Guard уже стоит
+	// на своём месте: приманки встанут внутрь готовой защиты fail-open.
+	guard := failopen.NewGuard(failopen.Config{
+		Detector: failopen.NoDetector{},
+		Events:   events,
+		Trust:    trust,
+		Logger:   logger,
+	})
+
+	adminSrv := admin.NewServer(admin.NewHandler(&ready, metrics.Handler(sensorMetrics(events, stats, guard))), logger)
 	proxySrv := proxy.NewServer(proxy.NewHandler(cfg.Upstream, proxy.Options{
-		Trust:  forwarded.NewResolver(cfg.TrustedProxies),
+		Trust:  trust,
 		Events: events,
+		Guard:  guard,
 		Stats:  stats,
 		Logger: logger,
 	}), logger)
@@ -269,7 +283,7 @@ func closeEvents(events *event.Recorder, logger *slog.Logger) {
 
 // sensorMetrics — список счётчиков для /metrics. Имена и метки — только
 // константы: ни одно значение из запроса не становится меткой.
-func sensorMetrics(events *event.Recorder, stats *proxy.Stats) []metrics.Metric {
+func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.Guard) []metrics.Metric {
 	const droppedHelp = "События, отброшенные сенсором, по причине: буфер полон, ошибка записи, сенсор останавливается."
 	ms := []metrics.Metric{
 		{Name: "sensor_events_emitted_total", Help: "События, принятые в буфер.", Kind: metrics.Counter,
@@ -295,6 +309,27 @@ func sensorMetrics(events *event.Recorder, stats *proxy.Stats) []metrics.Metric 
 		{Name: "sensor_connections_saturated_total", Help: "Сколько раз новое соединение ждало из-за предела соединений.",
 			Kind: metrics.Counter, Value: stats.Saturated.Load},
 	}
+	ms = append(ms,
+		metrics.Metric{Name: "sensor_fail_open", Help: "1 — обнаружение перегружено и проверяет только часть запросов (fail-open).",
+			Kind: metrics.Gauge, Value: func() uint64 {
+				if guard.Degraded() {
+					return 1
+				}
+				return 0
+			}},
+		metrics.Metric{Name: "sensor_fail_open_transitions_total", Help: "Переходы в fail-open из-за перегрузки обнаружения.",
+			Kind: metrics.Counter, Value: guard.Stats.Transitions.Load},
+		metrics.Metric{Name: "sensor_detection_inspected_total", Help: "Запросы, прошедшие обнаружение.",
+			Kind: metrics.Counter, Value: guard.Stats.Inspected.Load},
+		metrics.Metric{Name: "sensor_detection_bypassed_total", Help: "Запросы, пропущенные без обнаружения в режиме fail-open.",
+			Kind: metrics.Counter, Value: guard.Stats.Bypassed.Load},
+		metrics.Metric{Name: "sensor_detection_slow_total", Help: "Проверки обнаружения дольше порога.",
+			Kind: metrics.Counter, Value: guard.Stats.Slow.Load},
+		metrics.Metric{Name: "sensor_detection_panics_total", Help: "Паники в обнаружении; запрос ушёл в приложение без проверки.",
+			Kind: metrics.Counter, Value: guard.Stats.Panics.Load},
+		metrics.Metric{Name: "sensor_detection_aborted_total", Help: "Запросы, оборванные после паники в обнаружении: ответ уже начат или тело прочитано.",
+			Kind: metrics.Counter, Value: guard.Stats.Aborted.Load},
+	)
 	for _, c := range proxy.ErrorClasses() {
 		ms = append(ms, metrics.Metric{
 			Name: "sensor_upstream_errors_total", Help: "Запросы без ответа приложения, по классу причины.",
