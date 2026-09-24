@@ -113,11 +113,21 @@ func (r *Recorder) Emit(ev Event) {
 	}
 }
 
-// QueueLen — сколько событий ждут записи.
-func (r *Recorder) QueueLen() int { return len(r.queue) }
+// QueueLen — сколько событий ждут записи. uint64 — тип значений метрик.
+func (r *Recorder) QueueLen() uint64 { return toUint64(len(r.queue)) }
 
 // QueueCap — ёмкость буфера.
-func (r *Recorder) QueueCap() int { return cap(r.queue) }
+func (r *Recorder) QueueCap() uint64 { return toUint64(cap(r.queue)) }
+
+// toUint64 переводит длину в uint64. Отрицательной длина не бывает, но
+// перевод отрицательного int дал бы огромное число, и проверка здесь
+// делает безопасность перевода видимой — и читателю, и линтеру gosec.
+func toUint64(n int) uint64 {
+	if n < 0 {
+		return 0
+	}
+	return uint64(n)
+}
 
 // Close перестаёт принимать события, дописывает накопленные и закрывает
 // Sink. Ждёт не дольше, чем позволяет ctx: зависший диск не должен

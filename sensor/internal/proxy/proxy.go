@@ -23,8 +23,10 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/azuresong-afk/web_deception/sensor/internal/event"
 	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 	"github.com/azuresong-afk/web_deception/sensor/internal/respond"
 )
@@ -66,22 +68,93 @@ const (
 	copyBufferSize = 32 << 10
 )
 
+// Options — всё, что нужно обработчику, кроме адреса приложения.
+// Все поля обязательны.
+type Options struct {
+	// Trust решает, от каких соединений верить заголовкам о клиенте
+	// (ADR-0022).
+	Trust *forwarded.Resolver
+	// Events получает события; не ждёт (ADR-0023).
+	Events event.Emitter
+	// Stats — счётчики для /metrics.
+	Stats  *Stats
+	Logger *slog.Logger
+}
+
+// Stats — счётчики прокси. Атомарные: их увеличивают обработчики запросов,
+// а читает обработчик /metrics.
+type Stats struct {
+	// ConnectRejected — отвергнутые запросы CONNECT.
+	ConnectRejected atomic.Uint64
+	// ChainBroken — запросы от доверенного прокси с неразобранным
+	// X-Forwarded-For. Рост означает ошибку настройки прокси (ADR-0022).
+	ChainBroken atomic.Uint64
+	// Saturated — сколько раз новое соединение ждало из-за предела
+	// соединений.
+	Saturated atomic.Uint64
+	// UpstreamErrors — запросы, на которые не ответило приложение,
+	// по классам из ErrorClasses.
+	UpstreamErrors [numErrorClasses]atomic.Uint64
+}
+
+// ErrorClass — почему запрос не получил ответа приложения.
+type ErrorClass int
+
+const (
+	// ErrClientCanceled — клиент закрыл соединение сам.
+	ErrClientCanceled ErrorClass = iota
+	// ErrClientBodyTimeout — клиент замолчал посреди тела запроса (408).
+	ErrClientBodyTimeout
+	// ErrUpstreamTimeout — приложение не ответило вовремя (504).
+	ErrUpstreamTimeout
+	// ErrUpstreamUnreachable — не удалось соединиться с приложением (502).
+	ErrUpstreamUnreachable
+	// ErrUpstreamOther — прочие сбои обмена с приложением (502).
+	ErrUpstreamOther
+	numErrorClasses
+)
+
+// errorClassNames — значения метки class в /metrics. Константы из кода:
+// метка никогда не берётся из запроса или текста ошибки.
+var errorClassNames = [numErrorClasses]string{
+	ErrClientCanceled:      "client_canceled",
+	ErrClientBodyTimeout:   "client_body_timeout",
+	ErrUpstreamTimeout:     "upstream_timeout",
+	ErrUpstreamUnreachable: "upstream_unreachable",
+	ErrUpstreamOther:       "upstream_other",
+}
+
+// ErrorClasses — все классы по порядку, для построения /metrics.
+func ErrorClasses() []ErrorClass {
+	out := make([]ErrorClass, numErrorClasses)
+	for i := range out {
+		out[i] = ErrorClass(i)
+	}
+	return out
+}
+
+// String — имя класса для метки метрики.
+func (c ErrorClass) String() string { return errorClassNames[c] }
+
 // NewHandler собирает обработчик, передающий запросы в upstream.
 //
 // upstream приходит только из конфигурации (слой запуска, ADR-0018),
 // а не из запроса. Это главная защита от превращения сенсора в открытый
 // прокси: какой бы Host или адрес в строке запроса ни прислал атакующий,
 // соединение откроется только с приложением (угроза T17).
-//
-// trust решает, от каких соединений верить заголовкам о клиенте (ADR-0022).
-func NewHandler(upstream *url.URL, trust *forwarded.Resolver, logger *slog.Logger) http.Handler {
-	return newHandler(upstream, trust, logger, newTransport(), IOIdleTimeout)
+func NewHandler(upstream *url.URL, o Options) http.Handler {
+	return newHandler(upstream, o, newTransport(), IOIdleTimeout)
 }
 
 // newHandler — то же, что NewHandler, но с транспортом и сроком простоя
 // из параметров: тестам нужны короткие таймауты, а ждать минуту в каждом
 // тесте нельзя.
-func newHandler(upstream *url.URL, trust *forwarded.Resolver, logger *slog.Logger, transport http.RoundTripper, idle time.Duration) http.Handler {
+func newHandler(upstream *url.URL, o Options, transport http.RoundTripper, idle time.Duration) http.Handler {
+	// Пропущенное поле — ошибка программиста. Падаем при запуске, а не
+	// на первом запросе клиента.
+	if o.Trust == nil || o.Events == nil || o.Stats == nil || o.Logger == nil {
+		panic("proxy: в Options не заданы все поля")
+	}
 	rp := &httputil.ReverseProxy{
 		// Rewrite, а не устаревший Director. До вызова Rewrite ReverseProxy
 		// сам удаляет из исходящего запроса служебные заголовки соединения
@@ -107,17 +180,21 @@ func newHandler(upstream *url.URL, trust *forwarded.Resolver, logger *slog.Logge
 			// прокси, либо сенсор по своему соединению, но не клиент
 			// (угроза T1). Вся логика — в пакете forwarded: это единственное
 			// место, где такие заголовки разрешено читать.
-			forwarded.SetOutbound(pr.Out.Header, pr.In, trust.Resolve(pr.In))
+			client := o.Trust.Resolve(pr.In)
+			if client.ChainBroken {
+				o.Stats.ChainBroken.Add(1)
+			}
+			forwarded.SetOutbound(pr.Out.Header, pr.In, client)
 		},
 		Transport:    transport,
 		BufferPool:   newBufferPool(),
-		ErrorHandler: errorHandler(logger),
+		ErrorHandler: errorHandler(o.Logger, o.Stats),
 		// Сюда ReverseProxy пишет редкие внутренние ошибки, например обрыв
 		// копирования тела ответа. Данных запроса в этих сообщениях нет.
-		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+		ErrorLog: slog.NewLogLogger(o.Logger.Handler(), slog.LevelWarn),
 	}
 
-	return rejectConnect(withIOIdleDeadlines(rp, idle))
+	return rejectConnect(o, withIOIdleDeadlines(rp, idle))
 }
 
 // newTransport — клиент HTTP, которым сенсор ходит в приложение.
@@ -156,14 +233,29 @@ func newTransport() *http.Transport {
 	}
 }
 
-// rejectConnect отвергает метод CONNECT.
+// rejectConnect отвергает метод CONNECT и записывает событие.
 //
 // CONNECT просит прокси открыть туннель к произвольному адресу — ровно
 // то, что делает сенсор открытым прокси. Приложению за сенсором CONNECT
 // не нужен никогда: браузер отправляет его только прокси, а не сайту.
-func rejectConnect(next http.Handler) http.Handler {
+// Значит, CONNECT — это проверка «не открытый ли здесь прокси», и о ней
+// стоит знать (угроза T17). Обычно так делают сканеры интернета, поэтому
+// важность низкая: это шум, а не целевая атака.
+func rejectConnect(o Options, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodConnect {
+			o.Stats.ConnectRejected.Add(1)
+
+			ev := event.New(event.TypeConnectRejected, event.SeverityLow)
+			ev.Client = event.ClientFrom(o.Trust.Resolve(r))
+			ev.Request = event.RequestFrom(r)
+			// Куда клиент просил туннель — например, во внутреннюю сеть
+			// или на порт SSH. Обрезано и приведено к UTF-8.
+			ev.Data = map[string]string{"target": event.ConnectTarget(r)}
+			// Emit не ждёт: если буфер полон, событие потеряется
+			// и попадёт в счётчик, а клиент получит ответ без задержки.
+			o.Events.Emit(ev)
+
 			respond.Plain(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
@@ -181,13 +273,14 @@ func rejectConnect(next http.Handler) http.Handler {
 // транспорта есть фрагменты ответа приложения, а в ошибках клиента HTTP —
 // полный адрес запроса с параметрами, где бывают токены (CLAUDE.md,
 // раздел «Запрещено»). Пишем только класс ошибки и её тип.
-func errorHandler(logger *slog.Logger) func(http.ResponseWriter, *http.Request, error) {
+func errorHandler(logger *slog.Logger, stats *Stats) func(http.ResponseWriter, *http.Request, error) {
 	return func(w http.ResponseWriter, r *http.Request, err error) {
-		status, reason := classify(err)
+		class, status, reason := classify(err)
 		if clientBodyTimedOut(r) {
 			// Виноват клиент, а не приложение: 408, а не 504.
-			status, reason = http.StatusRequestTimeout, "клиент не прислал тело запроса вовремя"
+			class, status, reason = ErrClientBodyTimeout, http.StatusRequestTimeout, "клиент не прислал тело запроса вовремя"
 		}
+		stats.UpstreamErrors[class].Add(1)
 
 		attrs := []any{
 			slog.String("reason", reason),
@@ -207,23 +300,24 @@ func errorHandler(logger *slog.Logger) func(http.ResponseWriter, *http.Request, 
 	}
 }
 
-// classify сопоставляет ошибку транспорта с кодом ответа и причиной для лога.
-func classify(err error) (status int, reason string) {
+// classify сопоставляет ошибку транспорта с классом, кодом ответа
+// и причиной для лога.
+func classify(err error) (class ErrorClass, status int, reason string) {
 	if errors.Is(err, context.Canceled) {
-		return http.StatusBadGateway, "клиент закрыл соединение"
+		return ErrClientCanceled, http.StatusBadGateway, "клиент закрыл соединение"
 	}
 
 	var netErr net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
-		return http.StatusGatewayTimeout, "приложение не ответило вовремя"
+		return ErrUpstreamTimeout, http.StatusGatewayTimeout, "приложение не ответило вовремя"
 	}
 
 	var opErr *net.OpError
 	if errors.As(err, &opErr) && opErr.Op == "dial" {
-		return http.StatusBadGateway, "не удалось соединиться с приложением"
+		return ErrUpstreamUnreachable, http.StatusBadGateway, "не удалось соединиться с приложением"
 	}
 
-	return http.StatusBadGateway, "ошибка обмена с приложением"
+	return ErrUpstreamOther, http.StatusBadGateway, "ошибка обмена с приложением"
 }
 
 // bufferPool переиспользует буферы копирования тел между запросами.

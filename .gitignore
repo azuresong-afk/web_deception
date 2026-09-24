@@ -61,3 +61,6 @@ Thumbs.db
 .vscode/
 *.swp
 .claude/settings.local.json
+
+# События сенсора при make run-sensor: в них адреса клиентов.
+/.run/

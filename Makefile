@@ -59,7 +59,7 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
         security security-secrets security-go security-py security-sast \
         security-containers security-dockerfiles security-images \
         test test-go test-py test-scripts test-hooks hooks \
-        build run-sensor run-cp clean secrets images check-images smoke dev dev-demo dev-vulnbank \
+        build run-sensor run-cp clean secrets images check-images smoke smoke-events dev dev-demo dev-vulnbank \
         dev-ps dev-logs dev-down dev-reset vulnbank-requirements
 
 help: ## Показать список доступных команд
@@ -159,10 +159,15 @@ build: ## Собрать бинарник сенсора в bin/
 # Адрес приложения для make run-sensor. Сенсор без него не стартует:
 # значения по умолчанию в самом сенсоре нет намеренно (ADR-0021).
 SENSOR_UPSTREAM_URL ?= http://127.0.0.1:3000
+# Файл событий для make run-sensor. Каталог /var/lib/sensor есть только
+# в образе; при запуске на машине разработчика события пишутся сюда.
+# Каталог в .gitignore: в событиях адреса клиентов.
+SENSOR_EVENTS_FILE ?= $(CURDIR)/.run/events.jsonl
 
-run-sensor: ## Запустить сенсор: 127.0.0.1:8080 → SENSOR_UPSTREAM_URL, служебный 127.0.0.1:9090
+run-sensor: ## Запустить сенсор: 127.0.0.1:8080 → SENSOR_UPSTREAM_URL, служебный 127.0.0.1:9090, события в .run/
+	@mkdir -p -m 700 "$(dir $(SENSOR_EVENTS_FILE))"
 	cd $(SENSOR_DIR) && SENSOR_LISTEN_ADDR=127.0.0.1:8080 SENSOR_UPSTREAM_URL=$(SENSOR_UPSTREAM_URL) \
-		$(GO) run ./cmd/sensor
+		SENSOR_EVENTS_FILE=$(SENSOR_EVENTS_FILE) $(GO) run ./cmd/sensor
 
 run-cp: ## Запустить control plane на 127.0.0.1:8000
 	cd $(CP_DIR) && PYTHONPATH=src $(UV) run python -m webdeception_cp
@@ -286,8 +291,24 @@ smoke: ## Поднять стек с обеими учебными целями 
 	@echo "==> запрос через сенсор дошёл до Juice Shop"
 	curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8081/ | grep -q "VulnBank"
 	@echo "==> запрос через сенсор дошёл до VulnBank"
+	$(MAKE) smoke-events
 	$(MAKE) check-images
 	$(MAKE) dev-reset
+
+# Попытка CONNECT должна стать событием в файле внутри контейнера. Так
+# проверяется весь путь: права каталога в образе, том, буфер, запись.
+# В образе нет shell и cat, поэтому файл забираем через docker compose cp
+# (он отдаёт tar) и распаковываем в stdout.
+smoke-events:
+	@test "$$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 \
+		--request CONNECT --request-target 10.0.0.1:22 http://127.0.0.1:8080)" = 405
+	@for i in 1 2 3 4 5; do \
+		$(COMPOSE) --profile demo cp sensor-juice:/var/lib/sensor/events.jsonl - 2>/dev/null \
+			| tar -xO | grep -q '"type":"request.connect_rejected"' && break; \
+		if [ "$$i" -eq 5 ]; then echo "событие о CONNECT не появилось в файле событий"; exit 1; fi; \
+		sleep 1; \
+	done
+	@echo "==> попытка CONNECT записана в файл событий"
 
 dev: secrets ## Поднять control plane, PostgreSQL и NATS и дождаться готовности
 	VERSION=$(VERSION) $(COMPOSE) up --build --detach --wait

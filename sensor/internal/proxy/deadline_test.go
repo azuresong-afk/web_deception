@@ -110,7 +110,7 @@ func TestKeepAliveSurvivesIdle(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, "ok")
 	})
-	addr := startProxy(t, newHandler(mustURL(t, app.URL), noTrust, discardLogger(), newTransport(), idle), nil)
+	addr := startProxy(t, newHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger()), newTransport(), idle), nil)
 
 	client := &http.Client{
 		Timeout:   5 * time.Second,
@@ -150,7 +150,7 @@ func TestSlowBodyIsCutOff(t *testing.T) {
 
 	const idle = 200 * time.Millisecond
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, newHandler(mustURL(t, app.URL), noTrust, discardLogger(), newTransport(), idle), nil)
+	addr := startProxy(t, newHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger()), newTransport(), idle), nil)
 
 	c, err := net.Dial("tcp", addr)
 	if err != nil {

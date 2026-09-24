@@ -59,6 +59,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Errorf("LogLevel по умолчанию = %s, ожидался info", cfg.LogLevel)
 	}
+	if cfg.EventsFile != "/var/lib/sensor/events.jsonl" {
+		t.Errorf("EventsFile по умолчанию = %q", cfg.EventsFile)
+	}
 	// По умолчанию не доверяем никому: X-Forwarded-For не читается.
 	if len(cfg.TrustedProxies) != 0 {
 		t.Errorf("TrustedProxies по умолчанию = %v, ожидался пустой список", cfg.TrustedProxies)
@@ -81,6 +84,7 @@ func TestLoadReadsEnvironment(t *testing.T) {
 		"SENSOR_UPSTREAM_URL":     " https://app.internal:8443/ ",
 		"SENSOR_MAX_CONNS":        "5000",
 		"SENSOR_TRUSTED_PROXIES":  " 10.0.0.5 , 10.0.1.0/24,fd00::/8, 2001:db8::1 ",
+		"SENSOR_EVENTS_FILE":      " ./data//events.jsonl ",
 	}))
 	if err != nil {
 		t.Fatalf("Load вернул ошибку: %v", err)
@@ -96,6 +100,10 @@ func TestLoadReadsEnvironment(t *testing.T) {
 	}
 	if cfg.MaxConns != 5000 {
 		t.Errorf("MaxConns = %d, ожидалось 5000", cfg.MaxConns)
+	}
+	// Путь приводится к каноническому виду: без «./» и двойных «/».
+	if cfg.EventsFile != "data/events.jsonl" {
+		t.Errorf("EventsFile = %q, ожидался data/events.jsonl", cfg.EventsFile)
 	}
 	// Одиночный адрес становится сетью из одного адреса.
 	if got := fmt.Sprint(cfg.TrustedProxies); got != "[10.0.0.5/32 10.0.1.0/24 fd00::/8 2001:db8::1/128]" {
@@ -168,6 +176,10 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{"маска числом", map[string]string{"SENSOR_TRUSTED_PROXIES": "10.0.0.0/255.0.0.0"}, "10.0.0.0/24"},
 		{"лишняя запятая", map[string]string{"SENSOR_TRUSTED_PROXIES": "10.0.0.1,"}, "пустой элемент"},
 		{"точка с запятой вместо запятой", map[string]string{"SENSOR_TRUSTED_PROXIES": "10.0.0.1; 10.0.0.2"}, "10.0.0.0/24"},
+		// Файл событий.
+		{"каталог вместо файла", map[string]string{"SENSOR_EVENTS_FILE": "/var/lib/sensor/"}, "каталог"},
+		{"нулевой байт в пути", map[string]string{"SENSOR_EVENTS_FILE": "/tmp/a\x00b"}, "нулевой байт"},
+
 		{"слишком много записей", map[string]string{"SENSOR_TRUSTED_PROXIES": strings.Repeat("10.0.0.1,", 1024) + "10.0.0.1"}, "не больше 1024"},
 	}
 

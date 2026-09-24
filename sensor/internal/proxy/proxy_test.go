@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/azuresong-afk/web_deception/sensor/internal/event"
 	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 )
 
@@ -151,6 +152,28 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Disca
 // noTrust — сенсор без доверенных прокси, как по умолчанию.
 var noTrust = forwarded.NewResolver(nil)
 
+// memEvents — получатель событий для тестов: складывает их в память.
+type memEvents struct {
+	mu     sync.Mutex
+	events []event.Event
+}
+
+func (m *memEvents) Emit(ev event.Event) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.events = append(m.events, ev)
+}
+
+func (m *memEvents) all() []event.Event {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]event.Event(nil), m.events...)
+}
+
+func testOptions(trust *forwarded.Resolver, logger *slog.Logger) Options {
+	return Options{Trust: trust, Events: &memEvents{}, Stats: &Stats{}, Logger: logger}
+}
+
 // --- прозрачность --------------------------------------------------------------
 
 // TestForwardsTransparently: метод, путь, параметры, тело, заголовки и Host
@@ -165,7 +188,7 @@ func TestForwardsTransparently(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, "создано")
 	})
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		"http://"+addr+"/api/orders?id=5&sort=desc", strings.NewReader(`{"qty":2}`))
@@ -215,7 +238,7 @@ func TestPathIsNotNormalized(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	for _, path := range []string{"/a/../b/%2e%2e/c", "//double/slash", "/%2F/encoded"} {
 		code, _ := rawRequest(t, addr, "GET "+path+" HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -237,7 +260,7 @@ func TestUnparsableQueryParamsDropped(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	code, _ := rawRequest(t, addr, "GET /q?x=1;y=2&z=3 HTTP/1.1\r\nHost: x\r\n\r\n")
 	if code != http.StatusOK {
@@ -260,7 +283,7 @@ func TestUpstreamOnlyFromConfig(t *testing.T) {
 	internal := newFakeApp(t, nil)
 	internalHost := mustURL(t, internal.URL).Host
 
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	requests := []string{
 		"GET /x HTTP/1.1\r\nHost: " + internalHost + "\r\n\r\n",
@@ -288,14 +311,38 @@ func TestConnectRejected(t *testing.T) {
 	app := newFakeApp(t, nil)
 	internal := newFakeApp(t, nil)
 	internalHost := mustURL(t, internal.URL).Host
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	opts := testOptions(noTrust, discardLogger())
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), opts), nil)
 
-	code, _ := rawRequest(t, addr, "CONNECT "+internalHost+" HTTP/1.1\r\nHost: "+internalHost+"\r\n\r\n")
+	code, _ := rawRequest(t, addr, "CONNECT "+internalHost+" HTTP/1.1\r\nHost: "+internalHost+"\r\n"+
+		"User-Agent: proxy-checker/1.0\r\n\r\n")
 	if code != http.StatusMethodNotAllowed {
 		t.Errorf("CONNECT получил %d, ожидался 405", code)
 	}
 	if app.calls.Load() != 0 || internal.calls.Load() != 0 {
 		t.Error("CONNECT дошёл до приложения или внутреннего сервиса")
+	}
+
+	// Попытка записана событием: кто, куда просил туннель, чем.
+	events := opts.Events.(*memEvents).all()
+	if len(events) != 1 {
+		t.Fatalf("событий %d, ожидалось 1", len(events))
+	}
+	ev := events[0]
+	if ev.Type != event.TypeConnectRejected || ev.Severity != event.SeverityLow {
+		t.Errorf("тип %q, важность %q", ev.Type, ev.Severity)
+	}
+	if ev.Client == nil || ev.Client.IP != "127.0.0.1" {
+		t.Errorf("клиент события: %+v", ev.Client)
+	}
+	if ev.Request == nil || ev.Request.Method != "CONNECT" || ev.Request.UserAgent != "proxy-checker/1.0" {
+		t.Errorf("запрос события: %+v", ev.Request)
+	}
+	if ev.Data["target"] != internalHost {
+		t.Errorf("цель туннеля %q, ожидалась %q", ev.Data["target"], internalHost)
+	}
+	if opts.Stats.ConnectRejected.Load() != 1 {
+		t.Errorf("счётчик CONNECT = %d", opts.Stats.ConnectRejected.Load())
 	}
 }
 
@@ -311,7 +358,7 @@ func TestClientIPHeadersReplaced(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	spoofed := map[string]string{
 		"X-Forwarded-For":     "1.2.3.4",
@@ -364,7 +411,7 @@ func TestTrustedProxyChain(t *testing.T) {
 	// Тест подключается к сенсору с 127.0.0.1 — он и есть «балансировщик».
 	trust := forwarded.NewResolver([]netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")})
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), trust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(trust, discardLogger())), nil)
 
 	code, _ := rawRequest(t, addr, "GET / HTTP/1.1\r\nHost: app.internal\r\n"+
 		"X-Forwarded-For: 1.2.3.4, 203.0.113.7\r\n"+
@@ -393,6 +440,25 @@ func TestTrustedProxyChain(t *testing.T) {
 	}
 }
 
+// TestChainBrokenCounted: доверенный прокси прислал X-Forwarded-For,
+// который нельзя разобрать, — это ошибка настройки прокси, и она видна
+// в счётчике.
+func TestChainBrokenCounted(t *testing.T) {
+	t.Parallel()
+
+	trust := forwarded.NewResolver([]netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")})
+	opts := testOptions(trust, discardLogger())
+	app := newFakeApp(t, nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), opts), nil)
+
+	if code, _ := rawRequest(t, addr, "GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: unknown\r\n\r\n"); code != http.StatusOK {
+		t.Fatalf("код %d", code)
+	}
+	if n := opts.Stats.ChainBroken.Load(); n != 1 {
+		t.Errorf("счётчик оборванных цепочек = %d, ожидалось 1", n)
+	}
+}
+
 // TestHopByHopHeadersRemoved: заголовки соединения клиент—сенсор не уходят
 // в соединение сенсор—приложение. Proxy-Authorization среди них: учётные
 // данные для прокси не должны достаться приложению.
@@ -400,7 +466,7 @@ func TestHopByHopHeadersRemoved(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	code, _ := rawRequest(t, addr, "GET / HTTP/1.1\r\nHost: x\r\n"+
 		"Connection: keep-alive, X-Secret-Hop\r\n"+
@@ -428,7 +494,7 @@ func TestAmbiguousFramingIsNormalized(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	code, _ := rawRequest(t, addr, "POST /a HTTP/1.1\r\nHost: x\r\n"+
 		"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"+
@@ -452,7 +518,7 @@ func TestMalformedRequestsRejected(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	tests := []struct {
 		name string
@@ -481,7 +547,7 @@ func TestOversizedHeadersRejected(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	// Сервер Go добавляет к MaxHeaderBytes запас 4 КиБ на буфер чтения,
 	// поэтому превышение должно быть больше: +1 КиБ ещё проходит.
@@ -513,11 +579,16 @@ func TestUpstreamDownIsNeutral502(t *testing.T) {
 
 	var logBuf syncBuffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	addr := startProxy(t, NewHandler(mustURL(t, "http://"+deadAddr), noTrust, logger), nil)
+	opts := testOptions(noTrust, logger)
+	addr := startProxy(t, NewHandler(mustURL(t, "http://"+deadAddr), opts), nil)
 
 	code, body := rawRequest(t, addr, "GET /reset/confirm?token=SECRET-TOKEN-123 HTTP/1.1\r\nHost: x\r\n\r\n")
 	if code != http.StatusBadGateway || body != "Bad Gateway\n" {
 		t.Errorf("получено %d %q, ожидался нейтральный 502", code, body)
+	}
+	// Отказ посчитан по своему классу — это видно в /metrics.
+	if n := opts.Stats.UpstreamErrors[ErrUpstreamUnreachable].Load(); n != 1 {
+		t.Errorf("счётчик «приложение недоступно» = %d, ожидалось 1", n)
 	}
 	if strings.Contains(body, deadAddr) {
 		t.Error("ответ клиенту раскрывает адрес приложения")
@@ -547,7 +618,7 @@ func TestUpstreamTimeoutIs504(t *testing.T) {
 
 	tr := newTransport()
 	tr.ResponseHeaderTimeout = 100 * time.Millisecond
-	addr := startProxy(t, newHandler(mustURL(t, app.URL), noTrust, discardLogger(), tr, IOIdleTimeout), nil)
+	addr := startProxy(t, newHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger()), tr, IOIdleTimeout), nil)
 
 	code, body := rawRequest(t, addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
 	if code != http.StatusGatewayTimeout || body != "Gateway Timeout\n" {
@@ -559,20 +630,30 @@ func TestClassify(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name string
-		err  error
-		want int
+		name      string
+		err       error
+		wantClass ErrorClass
+		want      int
 	}{
-		{"клиент ушёл", context.Canceled, http.StatusBadGateway},
-		{"срок истёк", context.DeadlineExceeded, http.StatusGatewayTimeout},
-		{"сетевой таймаут", os.ErrDeadlineExceeded, http.StatusGatewayTimeout},
-		{"нет соединения", &net.OpError{Op: "dial", Err: errors.New("refused")}, http.StatusBadGateway},
-		{"прочее", errors.New("malformed response"), http.StatusBadGateway},
+		{"клиент ушёл", context.Canceled, ErrClientCanceled, http.StatusBadGateway},
+		{"срок истёк", context.DeadlineExceeded, ErrUpstreamTimeout, http.StatusGatewayTimeout},
+		{"сетевой таймаут", os.ErrDeadlineExceeded, ErrUpstreamTimeout, http.StatusGatewayTimeout},
+		{"нет соединения", &net.OpError{Op: "dial", Err: errors.New("refused")}, ErrUpstreamUnreachable, http.StatusBadGateway},
+		{"прочее", errors.New("malformed response"), ErrUpstreamOther, http.StatusBadGateway},
 	}
 	for _, tt := range tests {
-		if got, _ := classify(tt.err); got != tt.want {
-			t.Errorf("%s: %d, ожидался %d", tt.name, got, tt.want)
+		if class, got, _ := classify(tt.err); got != tt.want || class != tt.wantClass {
+			t.Errorf("%s: %s %d, ожидался %s %d", tt.name, class, got, tt.wantClass, tt.want)
 		}
+	}
+
+	// Имена классов — метки метрик: у каждого класса своё непустое имя.
+	seen := map[string]bool{}
+	for _, c := range ErrorClasses() {
+		if c.String() == "" || seen[c.String()] {
+			t.Errorf("класс %d: имя %q пустое или повторяется", c, c.String())
+		}
+		seen[c.String()] = true
 	}
 }
 
@@ -620,7 +701,7 @@ func TestUpgradePassesThrough(t *testing.T) {
 	}))
 	t.Cleanup(app.Close)
 
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), testOptions(noTrust, discardLogger())), nil)
 
 	c, err := net.Dial("tcp", addr)
 	if err != nil {

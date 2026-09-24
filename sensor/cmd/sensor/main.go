@@ -6,8 +6,10 @@
 //   - служебный — /healthz и /readyz для проверок живости, только на
 //     localhost по умолчанию (пакет admin).
 //
-// Приманок и событий пока нет: на этом шаге сенсор — прозрачный прокси.
-// Они появятся на следующих шагах этапа 2.
+// События (запуск, остановка, попытки CONNECT) пишутся в файл JSON Lines
+// через буфер, который никогда не задерживает трафик (пакет event),
+// счётчики — на служебном слушателе в /metrics (пакет metrics).
+// Приманок пока нет: они появятся на следующих шагах этапа 2.
 package main
 
 import (
@@ -22,11 +24,14 @@ import (
 	"os/signal"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/azuresong-afk/web_deception/sensor/internal/admin"
 	"github.com/azuresong-afk/web_deception/sensor/internal/config"
+	"github.com/azuresong-afk/web_deception/sensor/internal/event"
 	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 	"github.com/azuresong-afk/web_deception/sensor/internal/healthcheck"
+	"github.com/azuresong-afk/web_deception/sensor/internal/metrics"
 	"github.com/azuresong-afk/web_deception/sensor/internal/proxy"
 	"github.com/azuresong-afk/web_deception/sensor/internal/version"
 )
@@ -98,10 +103,30 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var ready atomic.Bool
+	// Файл событий открываем первым, до слушателей. Не открылся — сенсор
+	// не стартует: сенсор, который пропускает трафик и молча ничего
+	// не записывает, создаёт ложное чувство защищённости. Это ошибка
+	// развёртывания, и видна она сразу при запуске (ADR-0023).
+	sink, err := event.OpenFile(cfg.EventsFile)
+	if err != nil {
+		return fmt.Errorf("не удалось открыть файл событий: %w", err)
+	}
+	events := event.NewRecorder(sink, event.QueueSize, logger)
+	// Recorder закрываем при любом выходе из run, в том числе при ошибке
+	// открытия слушателей: иначе принятые события не допишутся в файл.
+	// Повторный Close безопасен.
+	defer closeEvents(events, logger)
 
-	adminSrv := admin.NewServer(admin.NewHandler(&ready), logger)
-	proxySrv := proxy.NewServer(proxy.NewHandler(cfg.Upstream, forwarded.NewResolver(cfg.TrustedProxies), logger), logger)
+	var ready atomic.Bool
+	stats := &proxy.Stats{}
+
+	adminSrv := admin.NewServer(admin.NewHandler(&ready, metrics.Handler(sensorMetrics(events, stats))), logger)
+	proxySrv := proxy.NewServer(proxy.NewHandler(cfg.Upstream, proxy.Options{
+		Trust:  forwarded.NewResolver(cfg.TrustedProxies),
+		Events: events,
+		Stats:  stats,
+		Logger: logger,
+	}), logger)
 
 	// Слушатели открываем синхронно, до запуска горутин. Если порт занят,
 	// сенсор должен упасть сразу с понятной ошибкой. Вариант с
@@ -124,7 +149,11 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	// Предел соединений — только на клиентском слушателе: служебный
 	// по умолчанию доступен лишь с самой машины, и ограничивать проверки
 	// живости значило бы рисковать ложным «сенсор мёртв» под нагрузкой.
-	proxyLn = proxy.LimitListener(proxyLn, cfg.MaxConns, proxy.SaturationLogger(logger, cfg.MaxConns))
+	saturationLog := proxy.SaturationLogger(logger, cfg.MaxConns)
+	proxyLn = proxy.LimitListener(proxyLn, cfg.MaxConns, func() {
+		stats.Saturated.Add(1)
+		saturationLog()
+	})
 
 	// Буфер на оба сервера: каждая горутина должна суметь записать результат
 	// и завершиться, даже если никто ещё не читает канал. Без буфера
@@ -155,6 +184,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 		slog.String("admin_addr", adminLn.Addr().String()),
 		slog.String("version", version.Version),
 	)
+	started := event.New(event.TypeSensorStarted, event.SeverityInfo)
+	started.Data = map[string]string{"version": version.Version}
+	events.Emit(started)
+
 	if onListen != nil {
 		onListen(listenAddrs{Admin: adminLn.Addr(), Proxy: proxyLn.Addr()})
 	}
@@ -165,11 +198,17 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	// и оркестратор не узнает, что его пора перезапустить.
 	var runErr error
 	pending := 2
+	reason := "signal"
 	select {
 	case runErr = <-serveErr:
 		pending = 1
+		reason = "error"
 	case <-ctx.Done():
 	}
+
+	stopping := event.New(event.TypeSensorStopping, event.SeverityInfo)
+	stopping.Data = map[string]string{"reason": reason}
+	events.Emit(stopping)
 
 	// Порядок здесь важен. Сначала снимаем готовность, и только потом
 	// останавливаем серверы: балансировщик или kubelet, опрашивающий
@@ -210,6 +249,59 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 
 	logger.Info("сенсор остановлен")
 	return nil
+}
+
+// eventsCloseTimeout — сколько при остановке ждать, пока допишутся события.
+// Отдельно от SENSOR_SHUTDOWN_TIMEOUT: тот к этому моменту может быть
+// израсходован на ожидание запросов клиентов.
+const eventsCloseTimeout = 5 * time.Second
+
+// closeEvents дописывает накопленные события и закрывает файл. Ошибка
+// здесь не меняет код выхода: трафик уже остановлен, а о потере событий
+// скажут лог и счётчики.
+func closeEvents(events *event.Recorder, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), eventsCloseTimeout)
+	defer cancel()
+	if err := events.Close(ctx); err != nil {
+		logger.Error("события при остановке записаны не полностью", slog.String("error", err.Error()))
+	}
+}
+
+// sensorMetrics — список счётчиков для /metrics. Имена и метки — только
+// константы: ни одно значение из запроса не становится меткой.
+func sensorMetrics(events *event.Recorder, stats *proxy.Stats) []metrics.Metric {
+	const droppedHelp = "События, отброшенные сенсором, по причине: буфер полон, ошибка записи, сенсор останавливается."
+	ms := []metrics.Metric{
+		{Name: "sensor_events_emitted_total", Help: "События, принятые в буфер.", Kind: metrics.Counter,
+			Value: events.Stats.Emitted.Load},
+		{Name: "sensor_events_written_total", Help: "События, записанные в файл.", Kind: metrics.Counter,
+			Value: events.Stats.Written.Load},
+		{Name: "sensor_events_dropped_total", Help: droppedHelp, Kind: metrics.Counter,
+			Label: `reason="queue_full"`, Value: events.Stats.DroppedQueueFull.Load},
+		{Name: "sensor_events_dropped_total", Help: droppedHelp, Kind: metrics.Counter,
+			Label: `reason="write_error"`, Value: events.Stats.DroppedWriteError.Load},
+		{Name: "sensor_events_dropped_total", Help: droppedHelp, Kind: metrics.Counter,
+			Label: `reason="stopped"`, Value: events.Stats.DroppedStopped.Load},
+		{Name: "sensor_events_sink_errors_total", Help: "Ошибки записи и сброса файла событий.", Kind: metrics.Counter,
+			Value: events.Stats.SinkErrors.Load},
+		{Name: "sensor_events_queue_length", Help: "События в буфере, ожидающие записи.", Kind: metrics.Gauge,
+			Value: events.QueueLen},
+		{Name: "sensor_events_queue_capacity", Help: "Ёмкость буфера событий.", Kind: metrics.Gauge,
+			Value: events.QueueCap},
+		{Name: "sensor_connect_rejected_total", Help: "Отвергнутые запросы CONNECT.", Kind: metrics.Counter,
+			Value: stats.ConnectRejected.Load},
+		{Name: "sensor_client_chain_broken_total", Help: "Запросы от доверенного прокси с неразобранным X-Forwarded-For.",
+			Kind: metrics.Counter, Value: stats.ChainBroken.Load},
+		{Name: "sensor_connections_saturated_total", Help: "Сколько раз новое соединение ждало из-за предела соединений.",
+			Kind: metrics.Counter, Value: stats.Saturated.Load},
+	}
+	for _, c := range proxy.ErrorClasses() {
+		ms = append(ms, metrics.Metric{
+			Name: "sensor_upstream_errors_total", Help: "Запросы без ответа приложения, по классу причины.",
+			Kind: metrics.Counter, Label: `class="` + c.String() + `"`, Value: stats.UpstreamErrors[c].Load,
+		})
+	}
+	return ms
 }
 
 // runHealthcheck выполняет одну проверку готовности и возвращает код выхода.

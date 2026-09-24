@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -39,6 +40,11 @@ const (
 	maxShutdownTimeout = 60 * time.Second
 
 	defaultLogLevel = slog.LevelInfo
+
+	// Файл событий по умолчанию. Каталог /var/lib/sensor есть в образе
+	// сенсора и принадлежит его пользователю; в compose на него смонтирован
+	// том, чтобы события переживали перезапуск контейнера.
+	defaultEventsFile = "/var/lib/sensor/events.jsonl"
 
 	// Клиентский слушатель, в отличие от служебного, по умолчанию открыт
 	// на всех интерфейсах: принимать трафик из сети — его работа. За ним
@@ -102,6 +108,10 @@ type Config struct {
 
 	// LogLevel — минимальный уровень сообщений в логе.
 	LogLevel slog.Level
+
+	// EventsFile — файл событий в формате JSON Lines (ADR-0023). Рядом
+	// с ним появляются старые файлы после ротации: EventsFile.1 … .4.
+	EventsFile string
 }
 
 // Getenv — источник переменных окружения.
@@ -122,6 +132,7 @@ func Load(getenv Getenv) (*Config, error) {
 		AdminAddr:       defaultAdminAddr,
 		ShutdownTimeout: defaultShutdownTimeout,
 		LogLevel:        defaultLogLevel,
+		EventsFile:      defaultEventsFile,
 	}
 
 	// Адрес приложения обязателен. Значения по умолчанию нет намеренно:
@@ -191,6 +202,14 @@ func Load(getenv Getenv) (*Config, error) {
 		cfg.LogLevel = lvl
 	}
 
+	if v := strings.TrimSpace(getenv("SENSOR_EVENTS_FILE")); v != "" {
+		p, err := parseEventsFile(v)
+		if err != nil {
+			return nil, fmt.Errorf("SENSOR_EVENTS_FILE: %w", err)
+		}
+		cfg.EventsFile = p
+	}
+
 	// Два слушателя на одном адресе — это не «один из них не запустится»,
 	// а непредсказуемо, какой именно: лучше отказаться стартовать сразу.
 	if cfg.ListenAddr == cfg.AdminAddr {
@@ -242,6 +261,23 @@ func parseUpstream(raw string) (*url.URL, error) {
 		}
 	}
 	return &url.URL{Scheme: u.Scheme, Host: u.Host}, nil
+}
+
+// parseEventsFile проверяет путь к файлу событий.
+//
+// Существование каталога и права здесь не проверяются: файл открывается
+// при запуске сенсора, и ошибка открытия остановит запуск с понятным
+// сообщением. Здесь — только то, что точно ошибка записи пути.
+func parseEventsFile(v string) (string, error) {
+	if strings.ContainsRune(v, 0) {
+		return "", fmt.Errorf("путь содержит нулевой байт")
+	}
+	// Путь, оканчивающийся на «/», — это каталог, а не файл: скорее всего,
+	// имя файла забыли.
+	if strings.HasSuffix(v, "/") {
+		return "", fmt.Errorf("%q — каталог; укажите файл, например %s", v, filepath.Join(v, "events.jsonl"))
+	}
+	return filepath.Clean(v), nil
 }
 
 // parseTrustedProxies разбирает список доверенных прокси: адреса и сети
@@ -336,7 +372,8 @@ func (c *Config) Warnings() []string {
 	if !isLoopbackHost(host) {
 		out = append(out, fmt.Sprintf(
 			"служебный слушатель привязан к %q и доступен не только с локальной машины: "+
-				"/healthz и /readyz будут видны в сети и выдадут присутствие сенсора (угроза T5); "+
+				"/healthz, /readyz и /metrics будут видны в сети и выдадут присутствие сенсора (угроза T5), "+
+				"а /metrics ещё и покажет, замечены ли действия атакующего; "+
 				"порт должен быть закрыт файрволом или сетевой политикой", c.AdminAddr))
 	}
 
