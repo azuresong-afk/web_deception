@@ -135,6 +135,48 @@ class DockerfileRulesTest(unittest.TestCase):
         )
         self.assertIn("D5", rules_for_dockerfile(text))
 
+    def test_d6_final_stage_not_distroless(self) -> None:
+        text = GOOD_DOCKERFILE.replace(
+            f"FROM gcr.io/distroless/static{DIGEST}", f"FROM python:3.13-slim{DIGEST}"
+        )
+        self.assertEqual(rules_for_dockerfile(text), {"D6"})
+
+    def test_d6_distroless_only_in_build_stage_does_not_count(self) -> None:
+        # Distroless в сборочной стадии не делает финальный образ distroless.
+        text = f"""
+FROM gcr.io/distroless/static{DIGEST} AS certs
+
+FROM debian:13-slim{DIGEST}
+COPY --from=certs /etc/ssl /etc/ssl
+USER 65532:65532
+"""
+        self.assertEqual(rules_for_dockerfile(text), {"D6"})
+
+    def test_d6_final_stage_from_named_stage_is_resolved(self) -> None:
+        # FROM <стадия> — смотрим на образ, с которого началась та стадия.
+        good = f"""
+FROM gcr.io/distroless/python3-debian13{DIGEST} AS base
+
+FROM base
+USER 65532:65532
+"""
+        self.assertEqual(rules_for_dockerfile(good), set())
+        bad = good.replace("gcr.io/distroless/python3-debian13", "python:3.13-slim")
+        self.assertEqual(rules_for_dockerfile(bad), {"D6"})
+
+    def test_d6_distroless_debug_variant(self) -> None:
+        # В отладочных вариантах distroless есть busybox с shell.
+        for tag in ("debug", "debug-nonroot"):
+            with self.subTest(tag=tag):
+                text = GOOD_DOCKERFILE.replace(
+                    f"gcr.io/distroless/static{DIGEST}", f"gcr.io/distroless/static:{tag}{DIGEST}"
+                )
+                self.assertEqual(rules_for_dockerfile(text), {"D6"})
+        nonroot = GOOD_DOCKERFILE.replace(
+            f"gcr.io/distroless/static{DIGEST}", f"gcr.io/distroless/static:nonroot{DIGEST}"
+        )
+        self.assertEqual(rules_for_dockerfile(nonroot), set())
+
     def test_line_continuations_are_joined(self) -> None:
         text = GOOD_DOCKERFILE.replace(
             f"FROM gcr.io/distroless/static{DIGEST}",

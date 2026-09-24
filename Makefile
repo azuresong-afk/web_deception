@@ -59,7 +59,7 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
         security security-secrets security-go security-py security-sast \
         security-containers security-dockerfiles security-images \
         test test-go test-py test-scripts test-hooks hooks \
-        build run-sensor run-cp clean secrets images smoke dev dev-demo dev-ps dev-logs \
+        build run-sensor run-cp clean secrets images check-images smoke dev dev-demo dev-ps dev-logs \
         dev-down dev-reset
 
 help: ## Показать список доступных команд
@@ -243,9 +243,33 @@ secrets: ## Создать локальные секреты (существую
 images: ## Собрать образы сенсора и control plane
 	VERSION=$(VERSION) $(COMPOSE) build
 
+# Образы продукта без shell и утилит (ADR-0020). Правило D6 в make lint
+# проверяет Dockerfile; эта проверка — то, что на самом деле оказалось
+# в собранном образе. Каждую программу пытаемся запустить: Docker возвращает
+# код 127, если её в образе нет. Любой другой код — провал: 0 значит,
+# что программа есть и выполнилась, 125 — что образа нет и проверять нечего.
+PRODUCT_IMAGES := webdeception/sensor:dev webdeception/controlplane:dev
+# /busybox/sh — shell в отладочных вариантах distroless (теги debug).
+FORBIDDEN_IN_IMAGES := /bin/sh /bin/bash /bin/dash /bin/ash /bin/busybox /busybox/sh \
+	/usr/bin/perl /usr/bin/apt-get /usr/bin/pip /usr/bin/curl /usr/bin/wget
+
+check-images: ## Убедиться, что в собранных образах продукта нет shell и утилит
+	@for img in $(PRODUCT_IMAGES); do \
+		for prog in $(FORBIDDEN_IN_IMAGES); do \
+			docker run --rm --network none --entrypoint "$$prog" "$$img" >/dev/null 2>&1; \
+			rc=$$?; \
+			if [ "$$rc" -ne 127 ]; then \
+				echo "$$img: $$prog — код $$rc, ожидался 127 (программы в образе нет)"; \
+				exit 1; \
+			fi; \
+		done; \
+	done
+	@echo "==> в образах продукта нет shell, perl, apt, pip, curl и wget"
+
 smoke: ## Поднять стек, убедиться в готовности, остановить и удалить данные
 	$(MAKE) dev
 	curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8000/readyz
+	$(MAKE) check-images
 	$(MAKE) dev-reset
 
 dev: secrets ## Поднять весь стек и дождаться готовности всех сервисов
