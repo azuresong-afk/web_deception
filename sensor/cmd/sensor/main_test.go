@@ -376,12 +376,12 @@ func TestRunCrossSiteTraps(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		body, err := io.ReadAll(resp.Body)
-		if cerr := resp.Body.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			t.Fatal(err)
+		body, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		// Текст ошибки не выводим: он получен из тела ответа, а данные
+		// тела в выводе запрещены (правило Semgrep, угроза T4).
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("%s %s: ответ не прочитан", method, path)
 		}
 		return reply{resp.StatusCode, resp.Header, string(body)}
 	}
