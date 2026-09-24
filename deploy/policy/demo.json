@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "version": "demo-2",
+  "version": "demo-3",
   "traps": [
     {
       "id": "env-file",
@@ -39,6 +39,42 @@
       }
     },
     {
+      "id": "old-admin",
+      "description": "Учебная ловушка №4: «старая админка» из строки Disallow в robots.txt",
+      "path": "/admin-backup",
+      "mode": "enforce",
+      "confidence": "medium",
+      "response": {
+        "status": 401,
+        "content_type": "text/plain",
+        "body": "Unauthorized\n"
+      }
+    },
+    {
+      "id": "api-docs",
+      "description": "Учебная ловушка №6: «переехавшая» документация API; ведёт к методу №8",
+      "path": "/internal/api/v2/docs",
+      "mode": "enforce",
+      "confidence": "medium",
+      "response": {
+        "status": 200,
+        "content_type": "application/json",
+        "body": "{\"service\":\"users-internal\",\"version\":\"2.3.1\",\"endpoints\":[{\"method\":\"GET\",\"path\":\"/api/Users\",\"auth\":\"bearer\"},{\"method\":\"POST\",\"path\":\"{{trap:api-export}}\",\"auth\":\"none\",\"note\":\"bulk export, internal network only\"}]}"
+      }
+    },
+    {
+      "id": "debug-trace",
+      "description": "Учебная ловушка №7: «отладочная» ссылка из заголовка X-Debug-Trace",
+      "path": "/internal/debug/trace",
+      "mode": "enforce",
+      "confidence": "medium",
+      "response": {
+        "status": 403,
+        "content_type": "application/json",
+        "body": "{\"error\":\"debug trace requires X-Debug-Token\"}"
+      }
+    },
+    {
       "id": "api-export",
       "description": "Учебная ловушка №8: «внутренний» метод API; только POST с JSON — без preflight чужая страница его не отправит",
       "path": "/api/internal/v1/users/export",
@@ -62,6 +98,21 @@
       "name": "account_role",
       "value": "customer",
       "confidence": "high"
+    }
+  ],
+  "lures": [
+    {
+      "id": "robots-admin",
+      "description": "Учебная наживка №4: строка Disallow в robots.txt",
+      "kind": "robots_txt",
+      "trap": "old-admin"
+    },
+    {
+      "id": "debug-header",
+      "description": "Учебная наживка №7: «отладочная» ссылка в заголовке ответа",
+      "kind": "header",
+      "header": "X-Debug-Trace",
+      "trap": "debug-trace"
     }
   ]
 }
