@@ -530,6 +530,11 @@ func TestMalformedRequestsRejected(t *testing.T) {
 		{"пробел в пути", "GET /sp ace HTTP/1.1\r\nHost: x\r\n\r\n", 400},
 		{"пробел в имени заголовка", "GET / HTTP/1.1\r\nHost: x\r\nX Bad: 1\r\n\r\n", 400},
 		{"нет Host в HTTP/1.1", "GET / HTTP/1.1\r\n\r\n", 400},
+		// Первый рубеж против управляющих последовательностей в событиях
+		// (T19): ESC в заголовке или пути не доходит даже до сенсора.
+		// Второй — экранирование JSON в пакете event.
+		{"ESC в заголовке", "GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: a\x1b[31mb\r\n\r\n", 400},
+		{"ESC в пути", "GET /a\x1b[31m HTTP/1.1\r\nHost: x\r\n\r\n", 400},
 	}
 	for _, tt := range tests {
 		if code, _ := rawRequest(t, addr, tt.raw); code != tt.want {

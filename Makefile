@@ -59,7 +59,7 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
         security security-secrets security-go security-py security-sast \
         security-containers security-dockerfiles security-images \
         test test-go test-py test-scripts test-hooks hooks \
-        build run-sensor run-cp clean secrets images check-images smoke smoke-events dev dev-demo dev-vulnbank \
+        build run-sensor run-cp clean secrets images check-images smoke smoke-events dev dev-demo dev-vulnbank dev-events \
         dev-ps dev-logs dev-down dev-reset vulnbank-requirements
 
 help: ## Показать список доступных команд
@@ -295,6 +295,9 @@ smoke: ## Поднять стек с обеими учебными целями 
 	$(MAKE) check-images
 	$(MAKE) dev-reset
 
+dev-events: ## Показать файл событий сенсора перед Juice Shop (make dev-demo)
+	@$(COMPOSE) --profile demo cp sensor-juice:/var/lib/sensor/events.jsonl - 2>/dev/null | tar -xO
+
 # Попытка CONNECT должна стать событием в файле внутри контейнера. Так
 # проверяется весь путь: права каталога в образе, том, буфер, запись.
 # В образе нет shell и cat, поэтому файл забираем через docker compose cp
@@ -335,10 +338,10 @@ dev-ps: ## Состояние контейнеров и их проверок з
 dev-logs: ## Логи всех сервисов
 	$(COMPOSE) $(ALL_PROFILES) logs --follow --tail=100
 
-dev-down: ## Остановить стек; данные базы сохраняются
+dev-down: ## Остановить стек; данные базы и события сенсоров сохраняются
 	$(COMPOSE) $(ALL_PROFILES) down
 
-dev-reset: ## Остановить стек и удалить данные базы
+dev-reset: ## Остановить стек и удалить данные базы и события сенсоров
 	$(COMPOSE) $(ALL_PROFILES) down --volumes
 
 # Список зависимостей VulnBank с хешами. Пересобирать при смене коммита
