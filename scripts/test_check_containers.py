@@ -209,6 +209,39 @@ USER 65532:65532
         )
         self.assertEqual(rules_for_dockerfile(nonroot), set())
 
+    def test_d5_git_by_full_sha_allowed(self) -> None:
+        sha = "4bb7cd5f46921959f034455e5615782481966177"
+        text = GOOD_DOCKERFILE.replace(
+            "COPY --from=build /out/app /app",
+            f"ADD https://github.com/owner/repo.git#{sha} /src\nCOPY --from=build /out/app /app",
+        )
+        self.assertEqual(rules_for_dockerfile(text), set())
+
+    def test_d5_network_add_without_full_sha(self) -> None:
+        sha = "4bb7cd5f46921959f034455e5615782481966177"
+        bad_sources = [
+            "https://github.com/owner/repo.git#main",  # ветка
+            "https://github.com/owner/repo.git#4bb7cd5",  # короткий SHA
+            "https://github.com/owner/repo.git",  # без ссылки
+            "git@github.com:owner/repo.git#v1.0",  # тег
+            "https://example.com/app.tar.gz",  # файл по HTTP
+            f"https://example.com/app.tar.gz#{sha}",  # файл по HTTP с «SHA» во фрагменте
+        ]
+        for source in bad_sources:
+            with self.subTest(source=source):
+                text = GOOD_DOCKERFILE.replace(
+                    "COPY --from=build /out/app /app",
+                    f"ADD {source} /src\nCOPY --from=build /out/app /app",
+                )
+                self.assertEqual(rules_for_dockerfile(text), {"D5"})
+
+    def test_d5_local_add_is_not_network(self) -> None:
+        text = GOOD_DOCKERFILE.replace(
+            "COPY --from=build /out/app /app",
+            "ADD --chown=0:0 rootfs.tar /\nCOPY --from=build /out/app /app",
+        )
+        self.assertNotIn("D5", rules_for_dockerfile(text))
+
     def test_d6_not_applied_to_demo_targets(self) -> None:
         # Учебной цели shell разрешён, остальные правила действуют.
         text = GOOD_DOCKERFILE.replace(

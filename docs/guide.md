@@ -261,8 +261,9 @@ make dev-reset    # остановить и удалить данные базы
 целью (ADR-0019): в `make dev` его нет, в `make dev-demo` и `make dev-vulnbank`
 — по экземпляру на цель. Две цели выбраны за разное устройство: Juice Shop —
 одностраничное приложение (SPA) с API, VulnBank — серверный рендеринг
-с HTML-формами, REST и GraphQL. Как устроен образ VulnBank и как его обновлять —
-в [deploy/demo/README.md](../deploy/demo/README.md).
+с HTML-формами, REST и GraphQL. Обе цели проверяются в CI: `make smoke`
+поднимает их за сенсорами и проверяет путь запроса. Как устроен образ VulnBank
+и как его обновлять — в [deploy/demo/README.md](../deploy/demo/README.md).
 
 Перед первым запуском `make dev` сам создаст секреты в
 `deploy/compose/secrets/` — этот каталог в git не попадает.
@@ -370,7 +371,7 @@ Workflow `.github/workflows/ci.yml` запускается на каждый PR 
 |---|---|
 | `make lint` | golangci-lint для Go (включая gosec), ruff и mypy для Python, политику контейнеров, actionlint для workflow |
 | `make test` | тесты Go с детектором гонок, тесты Python, тесты скриптов, пороги покрытия |
-| `make smoke` | поднимает стек с Juice Shop за сенсором, проверяет готовность и что запрос через сенсор доходит до приложения, отсутствие shell в образах, останавливает |
+| `make smoke` | поднимает стек с Juice Shop и VulnBank за сенсорами, проверяет готовность и что запросы через сенсоры доходят до приложений, отсутствие shell в образах, останавливает |
 | `make check-images` | в собранных образах продукта не запускаются `sh`, `bash`, `perl`, `apt-get`, `pip`, `curl`, `wget` |
 | `make hooks` | включает git-хуки в этом клоне — один раз |
 | `make test-hooks` | проверяет хуки настоящими коммитами во временном репозитории |

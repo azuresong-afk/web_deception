@@ -34,7 +34,7 @@ make dev-down        # остановить всё
 
 | Что | Как |
 |---|---|
-| исходники | репозиторий автора по полному SHA коммита (правило C8) |
+| исходники | репозиторий автора по полному SHA коммита, прямо в Dockerfile (правило D5) |
 | зависимости | только готовые колёса, хеш каждого файла проверяется |
 | базовый образ | по digest |
 | процесс | не от root, файловая система только для чтения, загрузки — в памяти с пределом 16 МБ |
@@ -49,9 +49,10 @@ Dependabot за коммитами чужого репозитория не сл
    `https://github.com/Commando-X/vuln-bank/compare/<текущий SHA>...main`.
    Особое внимание — новым сетевым функциям (новые SSRF, обращения
    к внешним сервисам) и изменениям в `requirements.txt`.
-2. Заменить SHA в `deploy/compose/compose.yaml` (`additional_contexts`)
-   и в шапке `vulnbank/requirements.in`.
+2. Заменить SHA в `vulnbank/Dockerfile` (строка `ADD`) и в шапке
+   `vulnbank/requirements.in`.
 3. Если у автора изменился `requirements.txt` — перенести изменения
    в `vulnbank/requirements.in` и выполнить `make vulnbank-requirements`.
-4. `make lint` (правило C8 проверит, что SHA полный),
+4. `make lint` (правило D5 проверит, что SHA полный),
    `make dev-vulnbank` и проверка руками: страница, вход, логи сенсора.
+   В CI сборку и запуск проверит `make smoke`.

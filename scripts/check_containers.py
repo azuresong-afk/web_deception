@@ -18,15 +18,17 @@
     C5  запрещено повышение привилегий
     C6  порты публикуются только на локальный адрес хоста
     C7  заданы лимиты памяти и числа процессов (сдерживание DoS, угроза T3)
-    C8  исходники сборки из git (контекст или дополнительный контекст)
-        закреплены по полному SHA коммита, а не по ветке или тегу
+    C8  исходники сборки из git в compose (контекст или дополнительный
+        контекст) закреплены по полному SHA коммита, а не по ветке или тегу
 
 Что проверяется в Dockerfile:
     D1  каждый базовый образ закреплён по digest
     D2  нигде нет тега latest
     D3  финальная стадия переключается на пользователя с числовым UID, не 0
     D4  директива "# syntax=" либо отсутствует, либо закреплена по digest
-    D5  нет ADD с загрузкой по URL: такой файл не проверяется ничем
+    D5  нет ADD с загрузкой по сети: такой файл не проверяется ничем.
+        Исключение одно — git-репозиторий по полному SHA коммита: сборка
+        сама проверяет, что получила именно этот коммит
     D6  финальная стадия построена на distroless: в образе продукта нет shell,
         менеджера пакетов и утилит (ADR-0020)
 
@@ -216,10 +218,8 @@ def check_dockerfile(where: str, text: str, *, product: bool = True) -> list[Vio
         elif instruction == "USER":
             final_user = args.strip()
 
-        elif instruction == "ADD" and re.search(r"(^|\s)https?://", args):
-            out.append(
-                Violation(where, "D5", "ADD с загрузкой по URL: содержимое ничем не проверяется")
-            )
+        elif instruction == "ADD":
+            out.extend(_check_add_sources(where, args))
 
     # D6 — только для образов продукта; учебным целям shell разрешён.
     if product:
@@ -241,6 +241,39 @@ def check_dockerfile(where: str, text: str, *, product: bool = True) -> list[Vio
             )
 
     return out
+
+
+def _check_add_sources(where: str, args: str) -> list[Violation]:
+    """D5: ADD по сети — только из git по полному SHA коммита."""
+    tokens = [t for t in args.split() if not t.startswith("--")]
+    out: list[Violation] = []
+    for source in tokens[:-1]:  # последний аргумент — куда копировать
+        if not _GIT_CONTEXT.match(source):
+            continue  # локальный файл: его содержимое — в нашем репозитории
+        if _is_git_source(source) and _PINNED_GIT_REF.search(source):
+            continue
+        out.append(
+            Violation(
+                where,
+                "D5",
+                f"ADD {source!r}: по сети разрешён только git-репозиторий "
+                "по полному SHA коммита — содержимое остального ничем не проверяется",
+            )
+        )
+    return out
+
+
+def _is_git_source(source: str) -> bool:
+    """Источник — git-репозиторий, а не файл по HTTP.
+
+    Сборка отличает git по тем же признакам: схема git:// или ssh://, адрес
+    вида git@host:repo или путь, оканчивающийся на .git. Иначе ссылка
+    http://сайт/архив.tar#<40 знаков> прошла бы как «закреплённая», хотя
+    скачивается обычным HTTP без всякой проверки.
+    """
+    if source.startswith(("git@", "git://", "ssh://")):
+        return True
+    return source.split("#", 1)[0].endswith(".git")
 
 
 def _check_distroless(where: str, final_base: str) -> list[Violation]:

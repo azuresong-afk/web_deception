@@ -206,13 +206,10 @@ services:
   # доступ к Docker и запуск от root.
   vulnbank:
     <<: *hardening
+    # Исходники автора скачиваются в самом Dockerfile по полному SHA коммита
+    # (правило D5). Обновление — вручную, см. deploy/demo/README.md.
     build:
       context: ../demo/vulnbank
-      additional_contexts:
-        # Исходники — репозиторий автора по полному SHA коммита, а не по ветке:
-        # ветку автор может переписать, коммит — нет (правило C8 проверки
-        # политики контейнеров). Обновление — вручную, см. deploy/demo/README.md.
-        vulnbank-src: https://github.com/Commando-X/vuln-bank.git#4bb7cd5f46921959f034455e5615782481966177
     image: webdeception/demo-vulnbank:dev
     profiles: [demo-vulnbank]
     user: "10001:10001"
