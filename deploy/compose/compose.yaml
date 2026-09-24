@@ -1,7 +1,9 @@
 # Стек для локальной разработки:
 #   make dev       — control plane, PostgreSQL, NATS;
 #   make dev-demo  — то же плюс учебная цель Juice Shop за сенсором
-#                    на 127.0.0.1:8080 (ADR-0019).
+#                    на 127.0.0.1:8080 (ADR-0019);
+#   make dev-vulnbank — то же плюс учебная цель VulnBank за сенсором
+#                    на 127.0.0.1:8081.
 #
 # Правила, которым подчиняется каждый сервис (проверяются автоматически
 # скриптом scripts/check_containers.py в `make lint`):
@@ -32,24 +34,34 @@ x-hardening: &hardening
       max-size: "10m"
       max-file: "3"
 
+# Общее для всех экземпляров сенсора.
+x-sensor: &sensor
+  <<: *hardening
+  build:
+    context: ../..
+    dockerfile: deploy/docker/sensor.Dockerfile
+    args:
+      VERSION: ${VERSION:-dev}
+  image: webdeception/sensor:dev
+  user: "65532:65532"
+  # Корневая файловая система только для чтения: атакующий, получивший
+  # выполнение кода, не сможет ни подменить бинарник, ни положить рядом свой.
+  read_only: true
+  # Лимиты — сдерживание отказа в обслуживании (угроза T3): утечка памяти
+  # или вышедший из-под контроля процесс не утащат за собой весь хост.
+  # Предел соединений сенсора по умолчанию (1024) рассчитан на этот лимит.
+  mem_limit: 128m
+  pids_limit: 128
+
 services:
 
   # Сенсор без приложения бессмыслен, поэтому он поднимается вместе с учебной
-  # целью в профиле demo (ADR-0019): make dev-demo. На каждую цель — свой
-  # экземпляр сенсора, потому что сенсор проксирует ровно одно приложение.
+  # целью (ADR-0019): make dev-demo — Juice Shop, make dev-vulnbank — VulnBank.
+  # На каждую цель — свой экземпляр сенсора, потому что сенсор проксирует
+  # ровно одно приложение. Общее у экземпляров — в якоре x-sensor ниже.
   sensor-juice:
-    <<: *hardening
-    build:
-      context: ../..
-      dockerfile: deploy/docker/sensor.Dockerfile
-      args:
-        VERSION: ${VERSION:-dev}
-    image: webdeception/sensor:dev
+    <<: *sensor
     profiles: [demo]
-    user: "65532:65532"
-    # Корневая файловая система только для чтения: атакующий, получивший
-    # выполнение кода, не сможет ни подменить бинарник, ни положить рядом свой.
-    read_only: true
     environment:
       SENSOR_LOG_LEVEL: info
       # Внутри контейнера слушаем все интерфейсы — иначе Docker не сможет
@@ -66,11 +78,20 @@ services:
     depends_on:
       juice-shop:
         condition: service_healthy
-    # Лимиты — сдерживание отказа в обслуживании (угроза T3): утечка памяти
-    # или вышедший из-под контроля процесс не утащат за собой весь хост.
-    # Предел соединений сенсора по умолчанию (1024) рассчитан на этот лимит.
-    mem_limit: 128m
-    pids_limit: 128
+
+  sensor-vulnbank:
+    <<: *sensor
+    profiles: [demo-vulnbank]
+    environment:
+      SENSOR_LOG_LEVEL: info
+      SENSOR_LISTEN_ADDR: 0.0.0.0:8080
+      SENSOR_UPSTREAM_URL: http://vulnbank:5000
+    ports:
+      - "127.0.0.1:8081:8080"
+    networks: [edge, demo-vulnbank]
+    depends_on:
+      vulnbank:
+        condition: service_healthy
 
   controlplane:
     <<: *hardening
@@ -177,6 +198,74 @@ services:
     mem_limit: 512m
     pids_limit: 256
 
+  # VulnBank — вторая учебная цель (ADR-0019): серверный рендеринг, HTML-формы,
+  # REST, GraphQL. Намеренно уязвима — в том числе отладчик Flask (выполнение
+  # кода) и SSRF, — поэтому живёт в своей сети без выхода в интернет и без
+  # порта на хосте, доступна только через sensor-vulnbank (угроза T16).
+  # Штатный compose автора не используется: там база открыта в сеть,
+  # доступ к Docker и запуск от root.
+  vulnbank:
+    <<: *hardening
+    # Исходники автора скачиваются в самом Dockerfile по полному SHA коммита
+    # (правило D5). Обновление — вручную, см. deploy/demo/README.md.
+    build:
+      context: ../demo/vulnbank
+    image: webdeception/demo-vulnbank:dev
+    profiles: [demo-vulnbank]
+    user: "10001:10001"
+    read_only: true
+    # Приложение пишет только загруженные файлы. Каталог — в памяти, с пределом
+    # размера: загрузка файлов — одна из уязвимостей приложения, и диск хоста
+    # не должен от неё пострадать.
+    tmpfs:
+      - /app/static/uploads:uid=10001,gid=10001,mode=0700,size=16m
+      - /tmp:size=16m
+    environment:
+      DB_HOST: vulnbank-db
+      DB_PORT: "5432"
+      DB_NAME: vulnerable_bank
+      DB_USER: vulnbank
+    networks: [demo-vulnbank]
+    depends_on:
+      vulnbank-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/', timeout=3).status == 200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    mem_limit: 512m
+    pids_limit: 256
+
+  # Отдельная база VulnBank — не база продукта. Данные в памяти: при каждом
+  # запуске приложение начинает с чистого листа.
+  vulnbank-db:
+    <<: *hardening
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    profiles: [demo-vulnbank]
+    user: "70:70"
+    read_only: true
+    tmpfs:
+      - /var/run/postgresql
+      - /tmp
+      - /var/lib/postgresql:uid=70,gid=70,mode=0700,size=256m
+    environment:
+      POSTGRES_DB: vulnerable_bank
+      POSTGRES_USER: vulnbank
+      # Пароля у учебной базы нет намеренно. Она доступна только самому
+      # VulnBank в изолированной сети, а пароль, записанный в репозитории,
+      # секретом бы не был — только видимостью защиты.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD", "pg_isready", "--username=vulnbank", "--dbname=vulnerable_bank"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [demo-vulnbank]
+    mem_limit: 256m
+    pids_limit: 128
+
 networks:
   # internal: true — у сети нет выхода наружу. Контейнеры в ней видят друг
   # друга, но не интернет. Скомпрометированная база не сможет выгрузить
@@ -184,8 +273,10 @@ networks:
   backend:
     internal: true
   edge: {}
-  # Сеть учебной цели: только цель и её сенсор, без выхода в интернет.
+  # Сети учебных целей: только цель, её сенсор (и база), без выхода в интернет.
   demo-juice:
+    internal: true
+  demo-vulnbank:
     internal: true
 
 volumes:

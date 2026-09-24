@@ -83,6 +83,23 @@ updates:
     commit-message:
       prefix: build
 
+  # Базовый образ учебной цели VulnBank (ADR-0019): только новые digest и патчи.
+  # Минорная версия Python закреплена: для зависимостей VulnBank нет готовых
+  # колёс под 3.13, а в CI этот образ не собирается, и поломку бы никто
+  # не заметил. Python-зависимости VulnBank Dependabot не трогает намеренно:
+  # они старые и уязвимые по замыслу — ради них учебную цель и берут.
+  - package-ecosystem: docker
+    directory: /deploy/demo/vulnbank
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    commit-message:
+      prefix: build
+
   # Образы в compose: PostgreSQL, NATS, Juice Shop и сканеры безопасности.
   # Устаревший сканер уязвимостей молча пропускает новые классы уязвимостей.
   - package-ecosystem: docker-compose

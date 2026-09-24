@@ -4,12 +4,13 @@
 docker/sensor.Dockerfile          образ сенсора: distroless, ~4 МБ, без shell
 docker/controlplane.Dockerfile    образ control plane: distroless с Python 3.13, без shell
 docker/requirements-build.txt     uv для сборки, с контрольными суммами
-compose/compose.yaml              стек для разработки; Juice Shop за сенсором — профиль demo
+compose/compose.yaml              стек для разработки; учебные цели за сенсором — профили demo и demo-vulnbank
+demo/                             учебные цели: свой образ VulnBank, зависимости с хешами (ADR-0019)
 compose/nats.conf                 своя конфигурация NATS вместо файла из образа
 compose/secrets/                  локальные секреты; создаются `make secrets`, в git не попадают
 ```
 
-Запуск — из корня репозитория: `make dev`, `make dev-demo`, `make dev-down`.
+Запуск — из корня репозитория: `make dev`, `make dev-demo`, `make dev-vulnbank`, `make dev-down`.
 Как устроены сети, какие правила действуют для каждого контейнера и почему —
 в [docs/guide.md](../docs/guide.md#локальный-стек-docker-compose) и
 [ADR-0014](../docs/adr/0014-containers.md).

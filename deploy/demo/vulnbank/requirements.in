@@ -1,0 +1,15 @@
+# Зависимости VulnBank — копия requirements.txt из репозитория
+# Commando-X/vuln-bank на коммите 4bb7cd5f46921959f034455e5615782481966177.
+# Версии намеренно старые и уязвимые: это учебная цель (ADR-0019).
+#
+# Из этого файла собирается requirements.txt с хешами каждого файла:
+#   make vulnbank-requirements
+flask==2.0.1
+werkzeug==2.0.1
+pyjwt==2.4.0
+flask-swagger-ui==4.11.1
+flask-cors==4.0.0
+psycopg2-binary==2.9.9
+python-dotenv==1.0.0
+requests==2.31.0
+graphene==3.3
