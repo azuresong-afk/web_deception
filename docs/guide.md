@@ -87,8 +87,10 @@ Web-deception встраивает в защищаемое веб-приложе
 ответ приложения возвращает клиенту без изменений. Записывает события
 ([ADR-0023](adr/0023-sensor-events.md)): запуск, остановку, попытки
 `CONNECT`, касания ловушек. Ловушки задаются файлом политики
-([ADR-0025](adr/0025-policy-format.md)); в демо-стенде их три — учебные
-`/.env`, `/.git/config`, `/backup.sql`.
+([ADR-0025](adr/0025-policy-format.md), [ADR-0026](adr/0026-cross-site-traps.md)).
+В демо-стенде их пять: учебные `/.env`, `/.git/config`, `/backup.sql`,
+«внутренний» метод API, который нельзя вызвать с чужого сайта,
+и cookie-ловушка.
 
 Что сенсор при этом делает сам:
 
@@ -103,7 +105,9 @@ Web-deception встраивает в защищаемое веб-приложе
   `X-Real-IP` и подобные) передаёт приложению только от доверенного прокси;
   от остальных удаляет и выставляет `X-Forwarded-For`, `-Host`, `-Proto`
   сам по своему соединению. Варианты с подчёркиванием (`X_Forwarded_For`)
-  удаляет всегда (угрозы T1, T18);
+  удаляет всегда (угрозы T1, T18). То же для `X-Original-URL`
+  и `X-Rewrite-URL`: по ним часть приложений берёт путь запроса, и от
+  клиента это обход запретов на пути ([ADR-0026](adr/0026-cross-site-traps.md));
 - ограничивает время и размер на каждом этапе: заголовки, паузы посреди
   тела и ответа, число соединений (угроза T3);
 - на сбой приложения отвечает нейтральным 502/504, без подробностей;
@@ -167,6 +171,31 @@ Web-deception встраивает в защищаемое веб-приложе
 Путь сравнивается после нормализации: `//.env`, `/./.env`, `/.env;x`,
 `/%2eenv` ловятся как `/.env`. В приложение уходит исходный путь.
 
+**Ловушки, которые нельзя вызвать с чужого сайта**
+([ADR-0026](adr/0026-cross-site-traps.md)). Чужая страница может заставить
+браузер пользователя запросить ловушку — картинкой, формой, `fetch`, —
+и касание припишется пользователю (угроза T2). Поэтому:
+
+- у ловушки на пути есть условия: `methods` — при каких методах запрос
+  считается касанием; `preflight_only: true` — только запрос, который
+  браузер с чужого сайта без предварительного запроса CORS не отправит
+  (например, `POST` с JSON или `DELETE`). «Простой» запрос — форма, картинка —
+  к такой ловушке не касание и идёт в приложение;
+- уверенность `high` и `very_high` — только с `preflight_only`: другую
+  политику сенсор не примет;
+- на preflight к таким ловушкам в режиме `enforce` отвечает сенсор —
+  `204` без одобрения CORS, даже если приложение одобряет CORS для всех;
+- cookie-ловушка (`cookie_traps`): сенсор выдаёт к ответу на переход
+  по странице cookie с заданным значением (`SameSite=Strict`, `HttpOnly`),
+  и запрос с изменённым значением — касание. С чужого сайта браузер
+  эту cookie не отправит. Значение не записывается никуда. Одна изменённая
+  cookie уходит с каждым запросом страницы, поэтому событие — одно
+  на клиента в минуту, а все касания — в счётчике.
+
+Имя cookie-ловушки не должно совпадать с cookie приложения, иначе касания
+будут у всех. Чтобы сменить наживку, меняйте имя, а не значение: иначе
+у всех, кто получил прежнее значение, оно окажется «изменённым».
+
 Как изменить политику в демо-стенде: правка `deploy/policy/demo.json`,
 затем `make policy-reload`. Сенсор проверяет её строго — неизвестные поля,
 повторяющиеся ключи, ловушку на `/`, HTML в ответе, перенаправления
@@ -189,8 +218,13 @@ Web-deception встраивает в защищаемое веб-приложе
 {"v":0,"id":"DWGKZ2UHWY7VAG4JRA2WOMNLXG","ts":"2026-09-24T17:22:11.644Z","type":"request.connect_rejected","severity":"low","client":{"ip":"172.19.0.1","peer":"172.19.0.1"},"request":{"method":"CONNECT","user_agent":"curl/8.5.0"},"data":{"target":"10.0.0.1:22"}}
 ```
 
-- Из запроса записываются только метод, путь, `User-Agent` и факт наличия
-  параметров. Тело, cookie, `Authorization`, значения параметров — никогда.
+- Из запроса записываются только метод, путь, `User-Agent`, факт наличия
+  параметров и заголовки `Sec-Fetch-*` (поле `sec_fetch`: только значения
+  из спецификации, иначе `other`). Тело, cookie, `Authorization`, значения
+  параметров — никогда.
+- `sec_fetch.site: cross-site` у касания — запрос пришёл с чужого сайта,
+  и касание могла вызвать чужая страница. Это ставит браузер, скрипт
+  изменить не может; инструмент атакующего может прислать что угодно.
 - В пути маскируются почта, UUID, JWT, числа, длинные шестнадцатеричные
   строки и токены: `/reset/9f8a7c6e5d4b3a2f` → `/reset/{hex}`.
 - Файл ротируется по 32 МиБ, хранятся 4 старых: не больше 160 МиБ на диске.
@@ -211,7 +245,11 @@ Web-deception встраивает в защищаемое веб-приложе
 `sensor_policy_traps` — сколько ловушек в текущей политике;
 `sensor_policy_loads_total{result="rejected"}` растёт — политика не принята,
 текст ошибки в событии `sensor.policy_rejected`; `sensor_decoy_touches_total` —
-касания по режиму.
+касания ловушек на путях по режиму; `sensor_cookie_touches_total` — все
+запросы с изменённой cookie-наживкой (в событиях — одно на клиента
+в минуту); `sensor_cookie_baits_total` — выданные наживки;
+`sensor_preflights_refused_total` — preflight к ловушкам, в которых сенсор
+отказал.
 
 **Где код и в каком порядке читать:**
 
@@ -227,18 +265,20 @@ sensor/internal/proxy/server.go          8. таймауты клиентски�
 sensor/internal/failopen/guard.go       9. fail-open: паника и перегрузка в обнаружении
 sensor/internal/failopen/mode.go       10. частичное обнаружение и гистерезис
 sensor/internal/policy/policy.go       11. формат политики, строгая проверка, нормализация пути
-sensor/internal/policy/file.go         12. чтение политики, атомарная копия последней валидной
-sensor/internal/decoy/decoy.go         13. касание ловушки: событие и ответ
-sensor/internal/decoy/loader.go        14. загрузка, откат на последнюю валидную, SIGHUP
-sensor/internal/event/event.go         15. формат события, что берётся из запроса
-sensor/internal/event/mask.go          16. маскирование пути
-sensor/internal/event/recorder.go      17. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
-sensor/internal/event/file.go          18. файл событий и ротация
-sensor/internal/metrics/metrics.go     19. /metrics в формате Prometheus
-sensor/internal/admin/server.go        20. служебный слушатель: фильтр путей, таймауты
-sensor/internal/respond/respond.go     21. ответы сенсора: нейтральные и ответ ловушки
-deploy/docker/sensor.Dockerfile        22. как собирается образ, каталог событий
-deploy/policy/demo.json                23. учебная политика: три ловушки
+sensor/internal/policy/preflight.go    12. какой запрос чужая страница не отправит без preflight
+sensor/internal/policy/file.go         13. чтение политики, атомарная копия последней валидной
+sensor/internal/decoy/decoy.go         14. касание ловушки, cookie-наживка, отказ в preflight
+sensor/internal/decoy/recent.go        15. одно событие о cookie-касании на клиента в минуту
+sensor/internal/decoy/loader.go        16. загрузка, откат на последнюю валидную, SIGHUP
+sensor/internal/event/event.go         17. формат события, что берётся из запроса, Sec-Fetch-*
+sensor/internal/event/mask.go          18. маскирование пути
+sensor/internal/event/recorder.go      19. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
+sensor/internal/event/file.go          20. файл событий и ротация
+sensor/internal/metrics/metrics.go     21. /metrics в формате Prometheus
+sensor/internal/admin/server.go        22. служебный слушатель: фильтр путей, таймауты
+sensor/internal/respond/respond.go     23. ответы сенсора: нейтральные, ловушки, отказ в preflight
+deploy/docker/sensor.Dockerfile        24. как собирается образ, каталог событий
+deploy/policy/demo.json                25. учебная политика: пять ловушек
 ```
 
 **Граница доверия.** Всё, что приходит по HTTP, враждебно: путь, метод,
@@ -261,7 +301,15 @@ curl -s http://127.0.0.1:8080/ | grep -o '<title>[^<]*'   # OWASP Juice Shop
 curl -s -o /dev/null -w '%{http_code}\n' -X CONNECT --request-target 10.0.0.1:22 http://127.0.0.1:8080   # 405
 curl -s http://127.0.0.1:8080/.env                # фейковый .env от ловушки
 curl -s http://127.0.0.1:8080//./.env             # то же: путь нормализуется
-make dev-events                                   # sensor.started, request.connect_rejected, decoy.touch
+# «внутренний» метод API: POST с JSON — ловушка, форма — ответ Juice Shop
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' http://127.0.0.1:8080/api/internal/v1/users/export
+curl -s -X POST -d 'a=1' http://127.0.0.1:8080/api/internal/v1/users/export | head -c 80; echo
+# preflight с чужого сайта: 204 без Access-Control-Allow-Origin (Juice Shop дал бы «*»)
+curl -si -X OPTIONS -H 'Origin: https://evil.example' -H 'Access-Control-Request-Method: POST' \
+  http://127.0.0.1:8080/api/internal/v1/users/export
+curl -si -H 'Sec-Fetch-Mode: navigate' http://127.0.0.1:8080/ | grep -i '^set-cookie'   # наживка
+curl -s -o /dev/null -H 'Cookie: account_role=admin' http://127.0.0.1:8080/   # касание cookie-ловушки
+make dev-events                                   # sensor.started, request.connect_rejected, decoy.touch (path и cookie)
 curl -s http://127.0.0.1:3000/                    # не отвечает: только через сенсор
 make dev-logs                                     # "сенсор запущен", upstream
 make dev-down
@@ -279,7 +327,8 @@ curl -s http://127.0.0.1:9090/metrics
 [ADR-0022](adr/0022-client-ip-trusted-proxies.md) — адрес клиента и доверенные прокси,
 [ADR-0023](adr/0023-sensor-events.md) — события: формат, буфер, файл, метрики,
 [ADR-0024](adr/0024-fail-open.md) — fail-open: паника и перегрузка в обнаружении,
-[ADR-0025](adr/0025-policy-format.md) — политика: формат, проверка, загрузка, ловушки.
+[ADR-0025](adr/0025-policy-format.md) — политика: формат, проверка, загрузка, ловушки,
+[ADR-0026](adr/0026-cross-site-traps.md) — ловушки, которые нельзя вызвать с чужого сайта.
 **Угрозы:** T1, T2, T3, T4, T5, T7, T17, T18, T19 в [модели угроз](threat-model.md).
 
 ---
