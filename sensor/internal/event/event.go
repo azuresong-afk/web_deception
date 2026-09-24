@@ -51,6 +51,14 @@ const (
 	// TypeConnectRejected — клиент прислал CONNECT: проверял, не открытый
 	// ли перед ним прокси (угроза T17). Сенсор ответил 405.
 	TypeConnectRejected Type = "request.connect_rejected"
+	// TypeFailOpen — обнаружение перегружено, сенсор проверяет только часть
+	// запросов (ADR-0024). Всегда critical.
+	TypeFailOpen Type = "sensor.fail_open"
+	// TypeFailOpenRecovered — обнаружение снова проверяет каждый запрос.
+	TypeFailOpenRecovered Type = "sensor.fail_open_recovered"
+	// TypeDetectionPanic — паника в обнаружении на этом запросе; запрос
+	// ушёл в приложение без проверки.
+	TypeDetectionPanic Type = "detection.panic"
 )
 
 // Severity — важность события.

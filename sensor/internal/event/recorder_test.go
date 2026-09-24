@@ -65,13 +65,17 @@ func closeRecorder(t *testing.T, r *Recorder) {
 	}
 }
 
+// TestRecorderWritesInOrder: события одной очереди записываются в том
+// порядке, в каком переданы, каждое — отдельной строкой.
 func TestRecorderWritesInOrder(t *testing.T) {
 	t.Parallel()
 
 	sink := &memSink{}
 	r := NewRecorder(sink, 16, discard())
-	for _, typ := range []Type{TypeSensorStarted, TypeConnectRejected, TypeSensorStopping} {
-		r.Emit(New(typ, SeverityInfo))
+	for i := range 3 {
+		ev := New(TypeConnectRejected, SeverityLow)
+		ev.Data = map[string]string{"n": strconv.Itoa(i)}
+		r.Emit(ev)
 	}
 	closeRecorder(t, r)
 
@@ -79,17 +83,104 @@ func TestRecorderWritesInOrder(t *testing.T) {
 	if len(lines) != 3 || !sink.closed {
 		t.Fatalf("записано %d строк, Sink закрыт: %v", len(lines), sink.closed)
 	}
-	for i, want := range []Type{TypeSensorStarted, TypeConnectRejected, TypeSensorStopping} {
-		if !strings.HasSuffix(lines[i], "\n") || strings.Count(lines[i], "\n") != 1 {
-			t.Errorf("строка %d не заканчивается ровно одним переводом строки: %q", i, lines[i])
+	for i, line := range lines {
+		if !strings.HasSuffix(line, "\n") || strings.Count(line, "\n") != 1 {
+			t.Errorf("строка %d не заканчивается ровно одним переводом строки: %q", i, line)
 		}
 		var ev Event
-		if err := json.Unmarshal([]byte(lines[i]), &ev); err != nil || ev.Type != want {
-			t.Errorf("строка %d: тип %q, ошибка %v; ожидался %q", i, ev.Type, err, want)
+		if err := json.Unmarshal([]byte(line), &ev); err != nil || ev.Data["n"] != strconv.Itoa(i) {
+			t.Errorf("строка %d: номер %q, ошибка %v", i, ev.Data["n"], err)
 		}
 	}
 	if r.Stats.Emitted.Load() != 3 || r.Stats.Written.Load() != 3 {
 		t.Errorf("счётчики: принято %d, записано %d", r.Stats.Emitted.Load(), r.Stats.Written.Load())
+	}
+}
+
+// TestPriorityEventSurvivesFlood — ради этого и заведён приоритетный
+// буфер: запись зависла, атакующий заливает буфер тысячами касаний,
+// а событие о переходе в fail-open всё равно записано.
+func TestPriorityEventSurvivesFlood(t *testing.T) {
+	t.Parallel()
+
+	sink := &memSink{block: make(chan struct{})}
+	r := NewRecorder(sink, 4, discard())
+
+	r.Emit(New(TypeConnectRejected, SeverityLow)) // займёт горутину записи
+	r.Emit(New(TypeFailOpen, SeverityCritical))
+	for range 10_000 {
+		r.Emit(New(TypeDetectionPanic, SeverityHigh))
+	}
+	close(sink.block)
+	closeRecorder(t, r)
+
+	found := false
+	for _, line := range sink.snapshot() {
+		if strings.Contains(line, `"type":"sensor.fail_open"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("событие о переходе в fail-open вытеснено потоком других событий")
+	}
+}
+
+// TestPriorityWrittenFirst: накопившиеся события о состоянии сенсора
+// записываются раньше накопившихся остальных. Поэтому файл не строго
+// хронологичен — порядок событий восстанавливают по полю ts.
+func TestPriorityWrittenFirst(t *testing.T) {
+	t.Parallel()
+
+	sink := &memSink{block: make(chan struct{})}
+	r := NewRecorder(sink, 16, discard())
+	for range 5 {
+		r.Emit(New(TypeConnectRejected, SeverityLow))
+	}
+	r.Emit(New(TypeFailOpen, SeverityCritical))
+	close(sink.block)
+	closeRecorder(t, r)
+
+	lines := sink.snapshot()
+	// Первое событие горутина записи могла взять до появления
+	// приоритетного — тогда приоритетное второе.
+	if !strings.Contains(lines[0]+lines[1], `"type":"sensor.fail_open"`) {
+		t.Errorf("приоритетное событие записано не первым: %v", lines)
+	}
+}
+
+// panicSink падает при записи события с заданной строкой внутри.
+type panicSink struct {
+	memSink
+	on string
+}
+
+func (s *panicSink) Write(line []byte) error {
+	if strings.Contains(string(line), s.on) {
+		panic("сбой записи")
+	}
+	return s.memSink.Write(line)
+}
+
+// TestWritePanicDoesNotCrash: паника в записи события не роняет сенсор —
+// событие потеряно и учтено, следующие пишутся.
+func TestWritePanicDoesNotCrash(t *testing.T) {
+	t.Parallel()
+
+	sink := &panicSink{on: `"n":"1"`}
+	r := NewRecorder(sink, 16, discard())
+	for i := range 3 {
+		ev := New(TypeConnectRejected, SeverityLow)
+		ev.Data = map[string]string{"n": strconv.Itoa(i)}
+		r.Emit(ev)
+	}
+	closeRecorder(t, r)
+
+	if got := len(sink.snapshot()); got != 2 {
+		t.Errorf("записано %d событий, ожидалось 2 — все, кроме вызвавшего панику", got)
+	}
+	if r.Stats.DroppedWriteError.Load() != 1 || r.Stats.SinkErrors.Load() != 1 {
+		t.Errorf("потеряно %d, ошибок %d; ожидалось 1 и 1",
+			r.Stats.DroppedWriteError.Load(), r.Stats.SinkErrors.Load())
 	}
 }
 
