@@ -34,3 +34,30 @@ func TestPlain(t *testing.T) {
 		t.Errorf("заголовок Server %q, ожидалось отсутствие", got)
 	}
 }
+
+func TestTrap(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	Trap(rec, http.StatusOK, "text/plain", "DB_HOST=db\n")
+	if rec.Code != http.StatusOK || rec.Body.String() != "DB_HOST=db\n" {
+		t.Errorf("ответ %d %q", rec.Code, rec.Body.String())
+	}
+	want := map[string]string{
+		"Content-Type":           "text/plain; charset=utf-8",
+		"X-Content-Type-Options": "nosniff",
+		"Cache-Control":          "no-store",
+	}
+	for k, v := range want {
+		if got := rec.Header().Get(k); got != v {
+			t.Errorf("%s = %q, ожидалось %q", k, got, v)
+		}
+	}
+
+	// Тип вне списка — ни при каких условиях не text/html.
+	rec = httptest.NewRecorder()
+	Trap(rec, http.StatusOK, "text/html", "<script>")
+	if got := rec.Header().Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("неизвестный тип отдан как %q", got)
+	}
+}

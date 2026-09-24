@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -220,6 +221,104 @@ func TestRunRecordsEventsAndMetrics(t *testing.T) {
 	want := []string{"sensor.started", "request.connect_rejected", "sensor.stopping"}
 	if strings.Join(types, ",") != strings.Join(want, ",") {
 		t.Errorf("события в файле: %v, ожидались %v", types, want)
+	}
+}
+
+// TestRunServesTrapsAndReloadsOnHUP — ловушки целиком: сенсор с политикой
+// отвечает на /.env вместо приложения и записывает касание; по SIGHUP
+// перечитывает политику; неверную не применяет и продолжает работать.
+func TestRunServesTrapsAndReloadsOnHUP(t *testing.T) {
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ответ приложения")
+	}))
+	defer app.Close()
+
+	cfg := testConfig(t, app.URL)
+	dir := t.TempDir()
+	cfg.PolicyFile = filepath.Join(dir, "policy.json")
+	cfg.PolicyCacheFile = filepath.Join(dir, "policy.last-valid.json")
+	writePolicy := func(version, body string) {
+		t.Helper()
+		p := `{"schema_version":1,"version":"` + version + `","traps":[{"id":"env-file","path":"/.env",` +
+			`"mode":"enforce","confidence":"low","response":{"status":200,"content_type":"text/plain","body":"` + body + `"}}]}`
+		if err := os.WriteFile(cfg.PolicyFile, []byte(p), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writePolicy("v1", "DB_HOST=first")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addrs, runErr := startSensor(ctx, t, cfg)
+	base := "http://" + addrs.Proxy.String()
+
+	if code, body := httpGet(t, base+"/.env"); code != http.StatusOK || body != "DB_HOST=first" {
+		t.Errorf("ловушка: %d %q", code, body)
+	}
+	if _, body := httpGet(t, base+"/catalog"); body != "ответ приложения" {
+		t.Errorf("обычный запрос не дошёл до приложения: %q", body)
+	}
+
+	// Новая политика — по сигналу, как `docker compose kill -s HUP`.
+	reload := func(want string) {
+		t.Helper()
+		if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			if _, body := httpGet(t, base+"/.env"); body == want {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("после SIGHUP ловушка не отвечает %q", want)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	writePolicy("v2", "DB_HOST=second")
+	reload("DB_HOST=second")
+
+	// Сломанная политика: остаётся v2, сенсор жив. Тело ловушки при этом
+	// не меняется, поэтому ждём не его, а отказ в /metrics — иначе тест
+	// проверял бы раньше, чем сенсор обработал сигнал.
+	if err := os.WriteFile(cfg.PolicyFile, []byte(`{"schema_version":1,`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(os.Getpid(), syscall.SIGHUP); err != nil {
+		t.Fatal(err)
+	}
+	var metricsBody string
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(metricsBody, `sensor_policy_loads_total{result="rejected"} 1`) {
+		if time.Now().After(deadline) {
+			t.Fatalf("отказ сломанной политики не виден в /metrics:\n%s", metricsBody)
+		}
+		time.Sleep(20 * time.Millisecond)
+		_, metricsBody = httpGet(t, "http://"+addrs.Admin.String()+"/metrics")
+	}
+	if _, body := httpGet(t, base+"/.env"); body != "DB_HOST=second" {
+		t.Errorf("после сломанной политики ловушка отвечает %q, ожидалась прежняя v2", body)
+	}
+	for _, want := range []string{`sensor_decoy_touches_total{mode="enforce"}`, "sensor_policy_traps 1\n"} {
+		if !strings.Contains(metricsBody, want) {
+			t.Errorf("в /metrics нет %q", want)
+		}
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("остановка: %v", err)
+	}
+
+	data, err := os.ReadFile(cfg.EventsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"type":"decoy.touch"`, `"decoy_id":"env-file"`, `"type":"sensor.policy_rejected"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("в файле событий нет %s", want)
+		}
 	}
 }
 
