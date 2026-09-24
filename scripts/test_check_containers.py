@@ -89,6 +89,38 @@ class ComposeRulesTest(unittest.TestCase):
         self.assertIn("C7", rules_for_service(pids_limit=None))
 
 
+class BuildContextRulesTest(unittest.TestCase):
+    SHA = "4bb7cd5f46921959f034455e5615782481966177"
+
+    def rules_for_build(self, build: dict[str, object]) -> set[str]:
+        return rules_for_service(image="webdeception/demo:dev", build=build)
+
+    def test_c8_local_context_is_fine(self) -> None:
+        self.assertNotIn("C8", self.rules_for_build({"context": "/src/deploy/demo/x"}))
+
+    def test_c8_git_context_pinned_by_sha(self) -> None:
+        pinned = f"https://github.com/owner/repo.git#{self.SHA}"
+        self.assertNotIn("C8", self.rules_for_build({"context": pinned}))
+        self.assertNotIn(
+            "C8", self.rules_for_build({"context": ".", "additional_contexts": {"src": pinned}})
+        )
+        # Подкаталог после SHA допустим.
+        self.assertNotIn("C8", self.rules_for_build({"context": pinned + ":sub/dir"}))
+
+    def test_c8_git_context_by_branch_or_tag(self) -> None:
+        for ref in ("", "#main", "#v1.2.3", "#4bb7cd5"):
+            with self.subTest(ref=ref):
+                url = "https://github.com/owner/repo.git" + ref
+                self.assertIn("C8", self.rules_for_build({"context": url}))
+                self.assertIn(
+                    "C8",
+                    self.rules_for_build({"context": ".", "additional_contexts": {"src": url}}),
+                )
+
+    def test_c8_ssh_git_context(self) -> None:
+        self.assertIn("C8", self.rules_for_build({"context": "git@github.com:owner/repo.git#main"}))
+
+
 class DockerfileRulesTest(unittest.TestCase):
     def test_compliant_dockerfile_passes(self) -> None:
         self.assertEqual(rules_for_dockerfile(GOOD_DOCKERFILE), set())
@@ -176,6 +208,49 @@ USER 65532:65532
             f"gcr.io/distroless/static{DIGEST}", f"gcr.io/distroless/static:nonroot{DIGEST}"
         )
         self.assertEqual(rules_for_dockerfile(nonroot), set())
+
+    def test_d5_git_by_full_sha_allowed(self) -> None:
+        sha = "4bb7cd5f46921959f034455e5615782481966177"
+        text = GOOD_DOCKERFILE.replace(
+            "COPY --from=build /out/app /app",
+            f"ADD https://github.com/owner/repo.git#{sha} /src\nCOPY --from=build /out/app /app",
+        )
+        self.assertEqual(rules_for_dockerfile(text), set())
+
+    def test_d5_network_add_without_full_sha(self) -> None:
+        sha = "4bb7cd5f46921959f034455e5615782481966177"
+        bad_sources = [
+            "https://github.com/owner/repo.git#main",  # ветка
+            "https://github.com/owner/repo.git#4bb7cd5",  # короткий SHA
+            "https://github.com/owner/repo.git",  # без ссылки
+            "git@github.com:owner/repo.git#v1.0",  # тег
+            "https://example.com/app.tar.gz",  # файл по HTTP
+            f"https://example.com/app.tar.gz#{sha}",  # файл по HTTP с «SHA» во фрагменте
+        ]
+        for source in bad_sources:
+            with self.subTest(source=source):
+                text = GOOD_DOCKERFILE.replace(
+                    "COPY --from=build /out/app /app",
+                    f"ADD {source} /src\nCOPY --from=build /out/app /app",
+                )
+                self.assertEqual(rules_for_dockerfile(text), {"D5"})
+
+    def test_d5_local_add_is_not_network(self) -> None:
+        text = GOOD_DOCKERFILE.replace(
+            "COPY --from=build /out/app /app",
+            "ADD --chown=0:0 rootfs.tar /\nCOPY --from=build /out/app /app",
+        )
+        self.assertNotIn("D5", rules_for_dockerfile(text))
+
+    def test_d6_not_applied_to_demo_targets(self) -> None:
+        # Учебной цели shell разрешён, остальные правила действуют.
+        text = GOOD_DOCKERFILE.replace(
+            f"FROM gcr.io/distroless/static{DIGEST}", f"FROM python:3.12-slim{DIGEST}"
+        )
+        self.assertEqual(cc.check_dockerfile("demo", text, product=False), [])
+        root = text.replace("USER 65532:65532\n", "")
+        rules = {v.rule for v in cc.check_dockerfile("demo", root, product=False)}
+        self.assertEqual(rules, {"D3"})
 
     def test_line_continuations_are_joined(self) -> None:
         text = GOOD_DOCKERFILE.replace(

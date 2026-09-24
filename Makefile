@@ -59,8 +59,8 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
         security security-secrets security-go security-py security-sast \
         security-containers security-dockerfiles security-images \
         test test-go test-py test-scripts test-hooks hooks \
-        build run-sensor run-cp clean secrets images check-images smoke dev dev-demo dev-ps dev-logs \
-        dev-down dev-reset
+        build run-sensor run-cp clean secrets images check-images smoke dev dev-demo dev-vulnbank \
+        dev-ps dev-logs dev-down dev-reset vulnbank-requirements
 
 help: ## Показать список доступных команд
 	@echo "Web-Deception — доступные команды:"
@@ -218,7 +218,8 @@ security-containers: security-dockerfiles images security-images
 
 security-dockerfiles:
 	@echo "==> Dockerfile: hadolint"
-	@$(SCANNERS) hadolint --no-color deploy/docker/sensor.Dockerfile deploy/docker/controlplane.Dockerfile
+	@$(SCANNERS) hadolint --no-color deploy/docker/sensor.Dockerfile deploy/docker/controlplane.Dockerfile \
+		deploy/demo/vulnbank/Dockerfile
 
 # Trivy сканирует уже собранные образы (make images). Образы передаются
 # ему файлами, а не через сокет Docker: сокет — это полный контроль над хостом.
@@ -273,14 +274,18 @@ check-images: ## Убедиться, что в собранных образах
 	done
 	@echo "==> в образах продукта нет shell, perl, apt, pip, curl и wget"
 
-# Сквозная проверка: запрос к сенсору доходит до Juice Shop, и клиент получает
-# его страницу. Это единственная проверка, что сенсор работает как прокси
-# в настоящем стеке, с нашими ограничениями контейнеров и сетей.
-smoke: ## Поднять стек с Juice Shop за сенсором, проверить путь запроса, остановить
+# Сквозная проверка: запросы к обоим сенсорам доходят до своих учебных целей,
+# и клиент получает их страницы. Это единственная проверка, что сенсор работает
+# как прокси в настоящем стеке, с нашими ограничениями контейнеров и сетей,
+# и что обе цели вообще собираются и запускаются.
+smoke: ## Поднять стек с обеими учебными целями за сенсорами, проверить путь запроса, остановить
 	$(MAKE) dev-demo
+	$(MAKE) dev-vulnbank
 	curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8000/readyz
 	curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8080/ | grep -q "OWASP Juice Shop"
 	@echo "==> запрос через сенсор дошёл до Juice Shop"
+	curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8081/ | grep -q "VulnBank"
+	@echo "==> запрос через сенсор дошёл до VulnBank"
 	$(MAKE) check-images
 	$(MAKE) dev-reset
 
@@ -292,17 +297,36 @@ dev-demo: secrets ## То же плюс OWASP Juice Shop за сенсором �
 	VERSION=$(VERSION) $(COMPOSE) --profile demo up --build --detach --wait
 	@$(COMPOSE) --profile demo ps
 
+# Учебная цель VulnBank (ADR-0019) — отдельный профиль, а не часть demo:
+# её образ собирается из исходников автора, и первый запуск заметно дольше.
+# В CI она проверяется вместе с Juice Shop в make smoke.
+dev-vulnbank: secrets ## То же, что dev, плюс VulnBank за сенсором на 127.0.0.1:8081
+	VERSION=$(VERSION) $(COMPOSE) --profile demo-vulnbank up --build --detach --wait
+	@$(COMPOSE) --profile demo-vulnbank ps
+
+# Команды ниже видят сервисы всех профилей: иначе dev-down оставил бы
+# работать учебную цель, поднятую другой командой.
+ALL_PROFILES := --profile demo --profile demo-vulnbank
+
 dev-ps: ## Состояние контейнеров и их проверок здоровья
-	$(COMPOSE) --profile demo ps
+	$(COMPOSE) $(ALL_PROFILES) ps
 
 dev-logs: ## Логи всех сервисов
-	$(COMPOSE) --profile demo logs --follow --tail=100
+	$(COMPOSE) $(ALL_PROFILES) logs --follow --tail=100
 
 dev-down: ## Остановить стек; данные базы сохраняются
-	$(COMPOSE) --profile demo down
+	$(COMPOSE) $(ALL_PROFILES) down
 
 dev-reset: ## Остановить стек и удалить данные базы
-	$(COMPOSE) --profile demo down --volumes
+	$(COMPOSE) $(ALL_PROFILES) down --volumes
+
+# Список зависимостей VulnBank с хешами. Пересобирать при смене коммита
+# VulnBank (см. deploy/demo/README.md). --only-binary — только готовые колёса:
+# сборка из исходников исполняла бы чужой код.
+vulnbank-requirements: ## Пересобрать deploy/demo/vulnbank/requirements.txt с хешами
+	cd deploy/demo/vulnbank && $(UV) pip compile requirements.in \
+		--generate-hashes --universal --python-version 3.12 --only-binary :all: \
+		--custom-compile-command "make vulnbank-requirements" -o requirements.txt
 
 clean: ## Удалить артефакты сборки и отчёты о покрытии
 	rm -rf $(BIN_DIR) $(SENSOR_DIR)/coverage.out $(CP_DIR)/.coverage
