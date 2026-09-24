@@ -8,8 +8,8 @@
 |---|---|---|
 | `go-no-sensitive-http-logging` | логирование заголовков целиком, Authorization, Cookie, Set-Cookie, тела, cookies, параметров запроса, полного URL | T4 |
 | `python-no-sensitive-http-logging` | то же для Python | T4 |
-| `go-untrusted-forwarded-headers` | прямое чтение X-Forwarded-For, X-Real-IP и подобных | T1 |
-| `python-untrusted-forwarded-headers` | то же для Python | T1 |
+| `go-untrusted-forwarded-headers` | чтение X-Forwarded-*, X-Real-IP и подобных (в том числе с `_` вместо `-`) где-либо, кроме пакета `sensor/internal/forwarded` | T1 |
+| `python-untrusted-forwarded-headers` | то же для Python, без исключений | T1 |
 | `github-actions-pin-by-sha` | action или workflow подключён не по полному SHA коммита | T12 |
 | `github-actions-dangerous-triggers` | события `pull_request_target` и `workflow_run` | T12 |
 | `go-mac-compare-constant-time` | сравнение MAC или подписи не за постоянное время | T7 |

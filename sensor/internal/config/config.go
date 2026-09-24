@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -55,6 +56,20 @@ const (
 	// не выдержит ни один разумный лимит памяти, и сенсор упадёт раньше,
 	// чем предел сработает.
 	maxMaxConns = 100_000
+
+	// Верхняя граница числа доверенных сетей. Самые длинные настоящие
+	// списки — диапазоны CDN — это десятки–сотни записей. Тысяча с запасом
+	// покрывает их и отсекает ошибку, при которой в переменную попал
+	// не тот файл.
+	maxTrustedProxies = 1024
+
+	// Самые широкие сети, которые можно объявить доверенными. /8 для IPv4 —
+	// это 10.0.0.0/8, самая большая частная сеть; /7 для IPv6 — fc00::/7,
+	// все уникальные локальные адреса. Шире не бывает сети «своих прокси»:
+	// такая запись — почти наверняка ошибка вроде 0.0.0.0/0, которая
+	// объявляет доверенным весь интернет (угроза T1).
+	minTrustedBits4 = 8
+	minTrustedBits6 = 7
 )
 
 // Config — конфигурация сенсора: слой запуска по ADR-0018. Здесь только то,
@@ -72,6 +87,12 @@ type Config struct {
 
 	// MaxConns — предел одновременных соединений клиентов.
 	MaxConns int
+
+	// TrustedProxies — сети доверенных прокси: балансировщиков и CDN
+	// перед сенсором. Только соединениям из них сенсор верит, когда они
+	// сообщают адрес клиента в X-Forwarded-For (пакет forwarded, ADR-0022).
+	// Пусто — не доверять никому: адрес клиента всегда адрес соединения.
+	TrustedProxies []netip.Prefix
 
 	// AdminAddr — адрес служебного слушателя (/healthz, /readyz).
 	AdminAddr string
@@ -131,6 +152,14 @@ func Load(getenv Getenv) (*Config, error) {
 			return nil, fmt.Errorf("SENSOR_MAX_CONNS: допустимо от 1 до %d, получено %d", maxMaxConns, n)
 		}
 		cfg.MaxConns = n
+	}
+
+	if v := strings.TrimSpace(getenv("SENSOR_TRUSTED_PROXIES")); v != "" {
+		p, err := parseTrustedProxies(v)
+		if err != nil {
+			return nil, fmt.Errorf("SENSOR_TRUSTED_PROXIES: %w", err)
+		}
+		cfg.TrustedProxies = p
 	}
 
 	if v := strings.TrimSpace(getenv("SENSOR_ADMIN_ADDR")); v != "" {
@@ -213,6 +242,78 @@ func parseUpstream(raw string) (*url.URL, error) {
 		}
 	}
 	return &url.URL{Scheme: u.Scheme, Host: u.Host}, nil
+}
+
+// parseTrustedProxies разбирает список доверенных прокси: адреса и сети
+// через запятую, например "10.0.0.5, 10.0.1.0/24, fd00::/8".
+//
+// Ошибка в этом списке — либо дыра (доверие чужим адресам, угроза T1),
+// либо сломанный продукт (адрес клиента всегда адрес балансировщика).
+// Поэтому проверка строгая: любое сомнительное значение — отказ стартовать
+// с объяснением, а не догадка, что имел в виду администратор.
+func parseTrustedProxies(v string) ([]netip.Prefix, error) {
+	parts := strings.Split(v, ",")
+	if len(parts) > maxTrustedProxies {
+		return nil, fmt.Errorf("не больше %d записей, получено %d", maxTrustedProxies, len(parts))
+	}
+	out := make([]netip.Prefix, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("пустой элемент списка: лишняя запятая?")
+		}
+		p, err := parseTrustedPrefix(part)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// parseTrustedPrefix разбирает одну запись: адрес или сеть.
+func parseTrustedPrefix(s string) (netip.Prefix, error) {
+	var p netip.Prefix
+	if strings.Contains(s, "/") {
+		parsed, err := netip.ParsePrefix(s)
+		if err != nil {
+			return p, fmt.Errorf("%q: ожидается адрес или сеть вида 10.0.0.0/24", s)
+		}
+		// 10.0.0.1/8 синтаксически верно, но неоднозначно: имелась
+		// в виду сеть 10.0.0.0/8 или один адрес 10.0.0.1? Первое доверяет
+		// 16 миллионам адресов, второе — одному. Не угадываем.
+		if parsed != parsed.Masked() {
+			return p, fmt.Errorf("%q: адрес сети содержит биты узла; имелась в виду сеть %s или один адрес %s?",
+				s, parsed.Masked(), parsed.Addr())
+		}
+		p = parsed
+	} else {
+		addr, err := netip.ParseAddr(s)
+		if err != nil {
+			return p, fmt.Errorf("%q: ожидается адрес или сеть вида 10.0.0.0/24", s)
+		}
+		if addr.Zone() != "" {
+			return p, fmt.Errorf("%q: зона IPv6 в адресе прокси не поддерживается", s)
+		}
+		p = netip.PrefixFrom(addr, addr.BitLen())
+	}
+
+	// ::ffff:10.0.0.1 — IPv4 в записи IPv6. Сенсор приводит такие адреса
+	// клиентов к IPv4, и сеть в записи IPv6 не совпала бы ни с одним из
+	// них: прокси молча перестал бы считаться доверенным.
+	if p.Addr().Is4In6() {
+		return p, fmt.Errorf("%q: IPv4 в записи IPv6 (::ffff:…) — запишите адрес как IPv4", s)
+	}
+
+	minBits := minTrustedBits4
+	if p.Addr().Is6() {
+		minBits = minTrustedBits6
+	}
+	if p.Bits() < minBits {
+		return p, fmt.Errorf("%q: сеть шире /%d не может быть сетью своих прокси; "+
+			"доверие ей позволило бы кому угодно подставить чужой адрес клиента (угроза T1)", s, minBits)
+	}
+	return p, nil
 }
 
 // Warnings возвращает предупреждения о конфигурации, которая формально

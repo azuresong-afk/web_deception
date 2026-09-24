@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 	"github.com/azuresong-afk/web_deception/sensor/internal/respond"
 )
 
@@ -71,35 +72,26 @@ const (
 // а не из запроса. Это главная защита от превращения сенсора в открытый
 // прокси: какой бы Host или адрес в строке запроса ни прислал атакующий,
 // соединение откроется только с приложением (угроза T17).
-func NewHandler(upstream *url.URL, logger *slog.Logger) http.Handler {
-	return newHandler(upstream, logger, newTransport(), IOIdleTimeout)
-}
-
-// clientIPHeaders — заголовки, которыми прокси сообщают приложению адрес
-// клиента. ReverseProxy сам удаляет только X-Forwarded-* и Forwarded;
-// остальные прошли бы к приложению в том виде, в каком их прислал клиент.
-// Приложение, настроенное доверять, например, X-Real-IP «от прокси», поверило
-// бы значению, которое подставил атакующий (угроза T1). Список совпадает
-// с правилом Semgrep go-untrusted-forwarded-headers.
-var clientIPHeaders = []string{
-	"X-Real-Ip",
-	"True-Client-Ip",
-	"Cf-Connecting-Ip",
-	"X-Client-Ip",
-	"X-Cluster-Client-Ip",
+//
+// trust решает, от каких соединений верить заголовкам о клиенте (ADR-0022).
+func NewHandler(upstream *url.URL, trust *forwarded.Resolver, logger *slog.Logger) http.Handler {
+	return newHandler(upstream, trust, logger, newTransport(), IOIdleTimeout)
 }
 
 // newHandler — то же, что NewHandler, но с транспортом и сроком простоя
 // из параметров: тестам нужны короткие таймауты, а ждать минуту в каждом
 // тесте нельзя.
-func newHandler(upstream *url.URL, logger *slog.Logger, transport http.RoundTripper, idle time.Duration) http.Handler {
+func newHandler(upstream *url.URL, trust *forwarded.Resolver, logger *slog.Logger, transport http.RoundTripper, idle time.Duration) http.Handler {
 	rp := &httputil.ReverseProxy{
-		// Rewrite, а не устаревший Director. Разница важна для безопасности:
-		// до вызова Rewrite ReverseProxy сам удаляет из исходящего запроса
-		// служебные заголовки соединения (hop-by-hop) и все заголовки
-		// X-Forwarded-* и Forwarded, присланные клиентом. С Director их
-		// пришлось бы вычищать вручную, и забытый заголовок означал бы,
-		// что приложение верит подставленному атакующим IP (угроза T1).
+		// Rewrite, а не устаревший Director. До вызова Rewrite ReverseProxy
+		// сам удаляет из исходящего запроса служебные заголовки соединения
+		// (hop-by-hop), а также X-Forwarded-For, X-Forwarded-Host,
+		// X-Forwarded-Proto и Forwarded, присланные клиентом. Остальные
+		// X-Forwarded-* он оставляет — их чистит пакет forwarded ниже.
+		//
+		// Поправка к шагу 3: тогда здесь было написано, что ReverseProxy
+		// удаляет «все X-Forwarded-*». Это неверно, и X-Forwarded-Port,
+		// -Prefix, -Ssl доходили до приложения от клиента (ADR-0022).
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			// Схема и адрес — строго из конфигурации.
 			pr.SetURL(upstream)
@@ -110,15 +102,12 @@ func newHandler(upstream *url.URL, logger *slog.Logger, transport http.RoundTrip
 			// На то, куда открывается соединение, Host не влияет.
 			pr.Out.Host = pr.In.Host
 
-			// Заголовки с адресом клиента, которые ReverseProxy не удалил сам.
-			for _, h := range clientIPHeaders {
-				pr.Out.Header.Del(h)
-			}
-
-			// X-Forwarded-For заполняется адресом TCP-соединения — тем,
-			// что атакующий подделать не может. Присланные клиентом значения
-			// уже удалены выше. Доверие заголовкам от своих прокси — шаг 5.
-			pr.SetXForwarded()
+			// Заголовки о клиенте и исходном запросе: X-Forwarded-*,
+			// X-Real-IP и подобные. Приложению их сообщает либо доверенный
+			// прокси, либо сенсор по своему соединению, но не клиент
+			// (угроза T1). Вся логика — в пакете forwarded: это единственное
+			// место, где такие заголовки разрешено читать.
+			forwarded.SetOutbound(pr.Out.Header, pr.In, trust.Resolve(pr.In))
 		},
 		Transport:    transport,
 		BufferPool:   newBufferPool(),

@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -18,6 +19,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 )
 
 // --- вспомогательное ---------------------------------------------------------
@@ -145,6 +148,9 @@ func rawRequest(t *testing.T, addr, raw string) (int, string) {
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }
 
+// noTrust — сенсор без доверенных прокси, как по умолчанию.
+var noTrust = forwarded.NewResolver(nil)
+
 // --- прозрачность --------------------------------------------------------------
 
 // TestForwardsTransparently: метод, путь, параметры, тело, заголовки и Host
@@ -159,7 +165,7 @@ func TestForwardsTransparently(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, "создано")
 	})
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		"http://"+addr+"/api/orders?id=5&sort=desc", strings.NewReader(`{"qty":2}`))
@@ -209,7 +215,7 @@ func TestPathIsNotNormalized(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	for _, path := range []string{"/a/../b/%2e%2e/c", "//double/slash", "/%2F/encoded"} {
 		code, _ := rawRequest(t, addr, "GET "+path+" HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -231,7 +237,7 @@ func TestUnparsableQueryParamsDropped(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	code, _ := rawRequest(t, addr, "GET /q?x=1;y=2&z=3 HTTP/1.1\r\nHost: x\r\n\r\n")
 	if code != http.StatusOK {
@@ -254,7 +260,7 @@ func TestUpstreamOnlyFromConfig(t *testing.T) {
 	internal := newFakeApp(t, nil)
 	internalHost := mustURL(t, internal.URL).Host
 
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	requests := []string{
 		"GET /x HTTP/1.1\r\nHost: " + internalHost + "\r\n\r\n",
@@ -282,7 +288,7 @@ func TestConnectRejected(t *testing.T) {
 	app := newFakeApp(t, nil)
 	internal := newFakeApp(t, nil)
 	internalHost := mustURL(t, internal.URL).Host
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	code, _ := rawRequest(t, addr, "CONNECT "+internalHost+" HTTP/1.1\r\nHost: "+internalHost+"\r\n\r\n")
 	if code != http.StatusMethodNotAllowed {
@@ -296,13 +302,16 @@ func TestConnectRejected(t *testing.T) {
 // --- заголовки с адресом клиента (угроза T1) ----------------------------------
 
 // TestClientIPHeadersReplaced: заголовки, которыми клиент мог бы выдать себя
-// за другой IP, до приложения не доходят; X-Forwarded-For содержит только
-// адрес TCP-соединения.
+// за другой IP или рассказать о «своём» исходном запросе, до приложения
+// не доходят; X-Forwarded-For содержит только адрес TCP-соединения.
+//
+// X-Forwarded-Port, -Prefix, -Ssl и вариант с подчёркиванием добавлены
+// на шаге 5: ReverseProxy их не удаляет, и до шага 5 они проходили.
 func TestClientIPHeadersReplaced(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	spoofed := map[string]string{
 		"X-Forwarded-For":     "1.2.3.4",
@@ -314,6 +323,10 @@ func TestClientIPHeadersReplaced(t *testing.T) {
 		"CF-Connecting-IP":    "1.2.3.4",
 		"X-Client-IP":         "1.2.3.4",
 		"X-Cluster-Client-IP": "1.2.3.4",
+		"X-Forwarded-Port":    "1.2.3.4",
+		"X-Forwarded-Prefix":  "/1.2.3.4",
+		"X-Forwarded-Ssl":     "1.2.3.4",
+		"X_Forwarded_For":     "1.2.3.4",
 	}
 	var raw strings.Builder
 	raw.WriteString("GET / HTTP/1.1\r\nHost: shop.example\r\n")
@@ -342,6 +355,44 @@ func TestClientIPHeadersReplaced(t *testing.T) {
 	}
 }
 
+// TestTrustedProxyChain: запрос пришёл от доверенного прокси — его
+// утверждения о клиенте проходят, а X-Forwarded-For пересобран: без того,
+// что атакующий дописал слева, и с адресом прокси справа.
+func TestTrustedProxyChain(t *testing.T) {
+	t.Parallel()
+
+	// Тест подключается к сенсору с 127.0.0.1 — он и есть «балансировщик».
+	trust := forwarded.NewResolver([]netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")})
+	app := newFakeApp(t, nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), trust, discardLogger()), nil)
+
+	code, _ := rawRequest(t, addr, "GET / HTTP/1.1\r\nHost: app.internal\r\n"+
+		"X-Forwarded-For: 1.2.3.4, 203.0.113.7\r\n"+
+		"X-Forwarded-Proto: https\r\n"+
+		"X-Forwarded-Host: shop.example\r\n"+
+		"X-Forwarded-Port: 443\r\n"+
+		"X_Forwarded_Proto: http\r\n\r\n")
+	if code != http.StatusOK {
+		t.Fatalf("код %d", code)
+	}
+	got := app.lastRequest(t).Header
+
+	want := map[string]string{
+		"X-Forwarded-For":   "203.0.113.7, 127.0.0.1",
+		"X-Forwarded-Proto": "https",
+		"X-Forwarded-Host":  "shop.example",
+		"X-Forwarded-Port":  "443",
+	}
+	for k, v := range want {
+		if vals := got.Values(k); len(vals) != 1 || vals[0] != v {
+			t.Errorf("%s = %q, ожидалось %q", k, vals, v)
+		}
+	}
+	if vals := got.Values("X_Forwarded_Proto"); len(vals) != 0 {
+		t.Errorf("вариант с подчёркиванием дошёл до приложения: %q", vals)
+	}
+}
+
 // TestHopByHopHeadersRemoved: заголовки соединения клиент—сенсор не уходят
 // в соединение сенсор—приложение. Proxy-Authorization среди них: учётные
 // данные для прокси не должны достаться приложению.
@@ -349,7 +400,7 @@ func TestHopByHopHeadersRemoved(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	code, _ := rawRequest(t, addr, "GET / HTTP/1.1\r\nHost: x\r\n"+
 		"Connection: keep-alive, X-Secret-Hop\r\n"+
@@ -377,7 +428,7 @@ func TestAmbiguousFramingIsNormalized(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	code, _ := rawRequest(t, addr, "POST /a HTTP/1.1\r\nHost: x\r\n"+
 		"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"+
@@ -401,7 +452,7 @@ func TestMalformedRequestsRejected(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	tests := []struct {
 		name string
@@ -430,7 +481,7 @@ func TestOversizedHeadersRejected(t *testing.T) {
 	t.Parallel()
 
 	app := newFakeApp(t, nil)
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	// Сервер Go добавляет к MaxHeaderBytes запас 4 КиБ на буфер чтения,
 	// поэтому превышение должно быть больше: +1 КиБ ещё проходит.
@@ -462,7 +513,7 @@ func TestUpstreamDownIsNeutral502(t *testing.T) {
 
 	var logBuf syncBuffer
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	addr := startProxy(t, NewHandler(mustURL(t, "http://"+deadAddr), logger), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, "http://"+deadAddr), noTrust, logger), nil)
 
 	code, body := rawRequest(t, addr, "GET /reset/confirm?token=SECRET-TOKEN-123 HTTP/1.1\r\nHost: x\r\n\r\n")
 	if code != http.StatusBadGateway || body != "Bad Gateway\n" {
@@ -496,7 +547,7 @@ func TestUpstreamTimeoutIs504(t *testing.T) {
 
 	tr := newTransport()
 	tr.ResponseHeaderTimeout = 100 * time.Millisecond
-	addr := startProxy(t, newHandler(mustURL(t, app.URL), discardLogger(), tr, IOIdleTimeout), nil)
+	addr := startProxy(t, newHandler(mustURL(t, app.URL), noTrust, discardLogger(), tr, IOIdleTimeout), nil)
 
 	code, body := rawRequest(t, addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
 	if code != http.StatusGatewayTimeout || body != "Gateway Timeout\n" {
@@ -569,7 +620,7 @@ func TestUpgradePassesThrough(t *testing.T) {
 	}))
 	t.Cleanup(app.Close)
 
-	addr := startProxy(t, NewHandler(mustURL(t, app.URL), discardLogger()), nil)
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), noTrust, discardLogger()), nil)
 
 	c, err := net.Dial("tcp", addr)
 	if err != nil {

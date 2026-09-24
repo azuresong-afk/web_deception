@@ -25,6 +25,7 @@ import (
 
 	"github.com/azuresong-afk/web_deception/sensor/internal/admin"
 	"github.com/azuresong-afk/web_deception/sensor/internal/config"
+	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 	"github.com/azuresong-afk/web_deception/sensor/internal/healthcheck"
 	"github.com/azuresong-afk/web_deception/sensor/internal/proxy"
 	"github.com/azuresong-afk/web_deception/sensor/internal/version"
@@ -100,7 +101,7 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 	var ready atomic.Bool
 
 	adminSrv := admin.NewServer(admin.NewHandler(&ready), logger)
-	proxySrv := proxy.NewServer(proxy.NewHandler(cfg.Upstream, logger), logger)
+	proxySrv := proxy.NewServer(proxy.NewHandler(cfg.Upstream, forwarded.NewResolver(cfg.TrustedProxies), logger), logger)
 
 	// Слушатели открываем синхронно, до запуска горутин. Если порт занят,
 	// сенсор должен упасть сразу с понятной ошибкой. Вариант с
@@ -147,6 +148,10 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 		slog.String("listen_addr", proxyLn.Addr().String()),
 		slog.String("upstream", cfg.Upstream.String()),
 		slog.Int("max_conns", cfg.MaxConns),
+		// Список доверенных прокси — в лог при каждом запуске: по нему
+		// видно, кому сенсор верит в X-Forwarded-For. В JSON — массив
+		// строк вида "10.0.0.0/24"; null — не доверяет никому.
+		slog.Any("trusted_proxies", cfg.TrustedProxies),
 		slog.String("admin_addr", adminLn.Addr().String()),
 		slog.String("version", version.Version),
 	)
