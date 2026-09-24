@@ -470,6 +470,8 @@ func TestFailOpenKeepsProtections(t *testing.T) {
 	if code != http.StatusOK || app.calls.Load() != 1 {
 		t.Fatalf("при падающем обнаружении: код %d %q, приложение вызвано %d раз", code, body, app.calls.Load())
 	}
+	// Тест проверяет, что заголовок удалён, а не доверяет его значению.
+	// nosemgrep: go-untrusted-forwarded-headers
 	if v := app.lastRequest(t).Header.Get("X-Real-Ip"); v != "" {
 		t.Errorf("заголовок клиента дошёл до приложения при fail-open: %q", v)
 	}

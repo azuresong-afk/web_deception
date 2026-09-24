@@ -157,7 +157,7 @@ func TestPanicPassesRequestThrough(t *testing.T) {
 		r.RemoteAddr = "203.0.113.7:5555"
 		rec, aborted := h.serve(r)
 		if aborted || rec.Body.String() != "app" {
-			t.Fatalf("после паники: оборвано %v, ответ %q; ожидался ответ приложения", aborted, rec.Body.String())
+			t.Fatalf("после паники: оборвано %v, ответ не от приложения", aborted)
 		}
 	}
 	if h.calls != 100 || h.bodies[0] != "body" {
