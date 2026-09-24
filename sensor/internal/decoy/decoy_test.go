@@ -559,3 +559,29 @@ func TestTrapResponseHasNoBait(t *testing.T) {
 		t.Errorf("в ответе ловушки наживка: %v", v)
 	}
 }
+
+// TestTouchRecordsLure: касание ловушки, к которой ведёт наживка, говорит,
+// какая именно: так видно, что прочитал атакующий.
+func TestTouchRecordsLure(t *testing.T) {
+	t.Parallel()
+
+	events := &memEvents{}
+	d := New(events, forwarded.NewResolver(nil))
+	d.Swap(mustCompile(t, `{"schema_version":1,"version":"v1","traps":[`+
+		trapJSON("old-admin", "/backup-admin", "enforce", "medium", "x")+`,`+
+		trapJSON("env-file", "/.env", "enforce", "low", "x")+`],`+
+		`"lures":[{"id":"robots-admin","kind":"robots_txt","trap":"old-admin"}]}`))
+
+	d.Inspect(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/backup-admin", nil))
+	d.Inspect(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/.env", nil))
+	touches := events.ofType(event.TypeDecoyTouch)
+	if len(touches) != 2 {
+		t.Fatalf("касаний %d", len(touches))
+	}
+	if touches[0].Data["lure_id"] != "robots-admin" {
+		t.Errorf("касание ловушки с наживкой: %v", touches[0].Data)
+	}
+	if _, ok := touches[1].Data["lure_id"]; ok {
+		t.Errorf("у ловушки без наживки есть lure_id: %v", touches[1].Data)
+	}
+}

@@ -35,6 +35,7 @@ import (
 	"github.com/azuresong-afk/web_deception/sensor/internal/failopen"
 	"github.com/azuresong-afk/web_deception/sensor/internal/forwarded"
 	"github.com/azuresong-afk/web_deception/sensor/internal/healthcheck"
+	"github.com/azuresong-afk/web_deception/sensor/internal/lure"
 	"github.com/azuresong-afk/web_deception/sensor/internal/metrics"
 	"github.com/azuresong-afk/web_deception/sensor/internal/proxy"
 	"github.com/azuresong-afk/web_deception/sensor/internal/version"
@@ -151,14 +152,23 @@ func run(ctx context.Context, cfg *config.Config, logger *slog.Logger, onListen 
 		Trust:    trust,
 		Logger:   logger,
 	})
+	// Наживки в ответах (ADR-0027) — по той же политике и под той же
+	// защитой fail-open, что и ловушки.
+	lures := lure.New(lure.Config{
+		Policy:   detector.Current,
+		Degraded: guard.Degraded,
+		OnPanic:  guard.RecordPanic,
+	})
 
-	adminSrv := admin.NewServer(admin.NewHandler(&ready, metrics.Handler(sensorMetrics(events, stats, guard, detector, loader))), logger)
+	adminSrv := admin.NewServer(admin.NewHandler(&ready,
+		metrics.Handler(sensorMetrics(events, stats, guard, detector, loader, lures))), logger)
 	proxySrv := proxy.NewServer(proxy.NewHandler(cfg.Upstream, proxy.Options{
 		Trust:  trust,
 		Events: events,
 		Guard:  guard,
 		Stats:  stats,
 		Logger: logger,
+		Lures:  lures,
 	}), logger)
 
 	// Слушатели открываем синхронно, до запуска горутин. Если порт занят,
@@ -321,7 +331,7 @@ func closeEvents(events *event.Recorder, logger *slog.Logger) {
 // sensorMetrics — список счётчиков для /metrics. Имена и метки — только
 // константы: ни одно значение из запроса не становится меткой.
 func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.Guard,
-	detector *decoy.Detector, loader *decoy.Loader) []metrics.Metric {
+	detector *decoy.Detector, loader *decoy.Loader, lures *lure.Injector) []metrics.Metric {
 	// Без SENSOR_POLICY_FILE загрузчика нет, и счётчики загрузок — нули.
 	loads := func(pick func(*decoy.LoaderStats) uint64) func() uint64 {
 		return func() uint64 {
@@ -397,7 +407,17 @@ func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.G
 			Kind: metrics.Counter, Value: detector.Stats.CookieBaits.Load},
 		metrics.Metric{Name: "sensor_preflights_refused_total", Help: "Предварительные запросы CORS к ловушкам с preflight_only, которые сенсор не одобрил.",
 			Kind: metrics.Counter, Value: detector.Stats.PreflightsRefused.Load},
+		metrics.Metric{Name: "sensor_lures_total", Help: "Ответы приложения, получившие наживку, по виду наживки.",
+			Kind: metrics.Counter, Label: `kind="header"`, Value: lures.Stats.Headers.Load},
+		metrics.Metric{Name: "sensor_lures_total", Help: "Ответы приложения, получившие наживку, по виду наживки.",
+			Kind: metrics.Counter, Label: `kind="robots_txt"`, Value: lures.Stats.Robots.Load},
 	)
+	for _, r := range lure.SkipReasons() {
+		ms = append(ms, metrics.Metric{
+			Name: "sensor_lures_skipped_total", Help: "Наживки, которые не поставлены, по причине.",
+			Kind: metrics.Counter, Label: `reason="` + r.String() + `"`, Value: lures.Stats.Skipped[r].Load,
+		})
+	}
 	for _, c := range proxy.ErrorClasses() {
 		ms = append(ms, metrics.Metric{
 			Name: "sensor_upstream_errors_total", Help: "Запросы без ответа приложения, по классу причины.",

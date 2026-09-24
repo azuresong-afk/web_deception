@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -439,6 +440,112 @@ func TestRunCrossSiteTraps(t *testing.T) {
 	}
 	if strings.Contains(string(data), "TAMPERED") {
 		t.Error("значение cookie попало в файл событий")
+	}
+}
+
+// TestRunLures — наживки через настоящий прокси. Приложение сжимает
+// robots.txt, если ему разрешено: сенсор должен попросить его без сжатия,
+// дописать строку-наживку и привести к ловушке с записью цепочки.
+func TestRunLures(t *testing.T) {
+	var robotsEncoding atomic.Value
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/robots.txt" {
+			_, _ = io.WriteString(w, "ответ приложения")
+			return
+		}
+		robotsEncoding.Store(r.Header.Get("Accept-Encoding"))
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			_, _ = io.WriteString(w, "\x1f\x8b сжатое")
+			return
+		}
+		_, _ = io.WriteString(w, "User-agent: *\nDisallow: /ftp")
+	}))
+	defer app.Close()
+
+	cfg := testConfig(t, app.URL)
+	dir := t.TempDir()
+	cfg.PolicyFile = filepath.Join(dir, "policy.json")
+	cfg.PolicyCacheFile = filepath.Join(dir, "policy.last-valid.json")
+	policy := `{"schema_version":1,"version":"v1","traps":[` +
+		`{"id":"old-admin","path":"/backup-admin","mode":"enforce","confidence":"medium",` +
+		`"response":{"status":401,"content_type":"text/plain","body":"auth required"}},` +
+		`{"id":"debug-trace","path":"/internal/debug/trace","mode":"enforce","confidence":"medium",` +
+		`"response":{"status":403,"content_type":"text/plain","body":"forbidden"}}],` +
+		`"lures":[{"id":"robots-admin","kind":"robots_txt","trap":"old-admin"},` +
+		`{"id":"debug-header","kind":"header","header":"X-Debug-Trace","trap":"debug-trace"}]}`
+	if err := os.WriteFile(cfg.PolicyFile, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addrs, runErr := startSensor(ctx, t, cfg)
+	base := "http://" + addrs.Proxy.String()
+
+	get := func(path string, headers ...string) (int, http.Header, string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < len(headers); i += 2 {
+			req.Header.Set(headers[i], headers[i+1])
+		}
+		// Транспорт без собственной распаковки: проверяем то, что пришло.
+		resp, err := (&http.Transport{DisableCompression: true}).RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("GET %s: ответ не прочитан", path)
+		}
+		return resp.StatusCode, resp.Header, string(body)
+	}
+
+	// Заголовок-наживка — на ответе приложения.
+	if _, h, body := get("/"); h.Get("X-Debug-Trace") != "/internal/debug/trace" || body != "ответ приложения" {
+		t.Errorf("заголовок-наживка: %q, тело %q", h.Get("X-Debug-Trace"), body)
+	}
+
+	// robots.txt: клиент разрешил gzip, но приложение получило запрос
+	// без сжатия, и строка-наживка дописана.
+	code, h, body := get("/robots.txt", "Accept-Encoding", "gzip, br")
+	if code != http.StatusOK || body != "User-agent: *\nDisallow: /ftp\n\nUser-agent: *\nDisallow: /backup-admin\n" ||
+		h.Get("Content-Encoding") != "" {
+		t.Errorf("robots.txt: %d %q %v", code, body, h)
+	}
+	if got, _ := robotsEncoding.Load().(string); got != "identity" {
+		t.Errorf("приложение получило Accept-Encoding %q", got)
+	}
+
+	// Атакующий идёт по наживке — касание с цепочкой.
+	if code, _, _ := get("/backup-admin"); code != http.StatusUnauthorized {
+		t.Errorf("ловушка из robots.txt: %d", code)
+	}
+
+	// Заголовок — на двух ответах приложения: странице и robots.txt.
+	// Ответ ловушки даёт сенсор, а не приложение, — он наживку не несёт.
+	_, metricsBody := httpGet(t, "http://"+addrs.Admin.String()+"/metrics")
+	for _, want := range []string{`sensor_lures_total{kind="robots_txt"} 1` + "\n", `sensor_lures_total{kind="header"} 2` + "\n"} {
+		if !strings.Contains(metricsBody, want) {
+			t.Errorf("в /metrics нет %q", want)
+		}
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("остановка: %v", err)
+	}
+	data, err := os.ReadFile(cfg.EventsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"decoy_id":"old-admin"`) || !strings.Contains(string(data), `"lure_id":"robots-admin"`) {
+		t.Error("в событиях нет касания с цепочкой robots-admin → old-admin")
 	}
 }
 

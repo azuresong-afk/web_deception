@@ -2,13 +2,16 @@
 // нормализация пути для сравнения с ловушками, загрузка из файла.
 //
 // Политика — данные, а не код (ADR-0018): сенсор понимает фиксированный
-// набор конструкций, и администратор меняет их параметры. Конструкций две:
+// набор конструкций, и администратор меняет их параметры. Ловушек два вида:
 //   - ловушка на пути (шаг 8, ADR-0025): запрос к этому пути — касание,
 //     а сенсор отвечает вместо приложения заданным ответом или только
 //     записывает касание (режим наблюдения). С шага 9 у неё есть условия:
 //     методы и «только запросы с preflight» (ADR-0026);
 //   - cookie-ловушка (шаг 9, ADR-0026): сенсор выдаёт браузеру cookie
 //     с заданным значением, и запрос с изменённым значением — касание.
+//
+// И наживки (шаг 10, ADR-0027) — строки в ответах приложения, которые
+// ведут к ловушкам на путях (lure.go).
 //
 // Граница доверия: политику пишет администратор, а с этапа 3 — control
 // plane, который может быть взломан (угроза T15). Поэтому сенсор проверяет
@@ -88,6 +91,8 @@ type Policy struct {
 	Traps   []Trap `json:"traps"`
 	// CookieTraps — необязательно.
 	CookieTraps []CookieTrap `json:"cookie_traps"`
+	// Lures — необязательно.
+	Lures []Lure `json:"lures"`
 }
 
 // Trap — ловушка на пути.
@@ -109,7 +114,15 @@ type Trap struct {
 	// пользователя (угроза T2, ADR-0026). Обязательно для уверенности
 	// high и very_high.
 	PreflightOnly bool `json:"preflight_only"`
+
+	// lureID — наживка или ловушка, чей ответ ведёт к этой ловушке
+	// (ADR-0027); подставляется при разборе.
+	lureID string
 }
+
+// LureID — откуда атакующий мог узнать путь ловушки: id наживки или
+// ловушки, в ответе которой он записан. Пусто — ниоткуда из политики.
+func (t *Trap) LureID() string { return t.lureID }
 
 // Accepts — выполнены ли условия ловушки для запроса, путь которого уже
 // совпал.
@@ -191,6 +204,9 @@ type Compiled struct {
 	cookies []*CookieTrap
 	// cookieByName — те же cookie-ловушки по имени cookie.
 	cookieByName map[string]*CookieTrap
+	lures        []*Lure
+	headerLures  []*Lure
+	robotsPaths  []string
 }
 
 // Empty — политика без ловушек: обнаружения нет.
@@ -259,6 +275,7 @@ func Parse(data []byte) (*Compiled, error) {
 		c.cookies = append(c.cookies, &t)
 		c.cookieByName[t.Name] = &t
 	}
+	compileLures(&p, c)
 	return c, nil
 }
 
@@ -397,6 +414,8 @@ func validate(p *Policy) error {
 			add("%s.confidence: обязательна, low, medium, high или very_high", at)
 		}
 	}
+
+	validateLures(p, ids, add)
 	return errors.Join(errs...)
 }
 

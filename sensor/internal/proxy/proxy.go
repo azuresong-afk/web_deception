@@ -84,6 +84,20 @@ type Options struct {
 	// Stats — счётчики для /metrics.
 	Stats  *Stats
 	Logger *slog.Logger
+	// Lures — наживки в ответах приложения (ADR-0027). Необязательно:
+	// nil — ответы приложения уходят клиенту без изменений.
+	Lures Lures
+}
+
+// Lures правит запрос к приложению и его ответ, чтобы поставить наживки.
+// Реализация — пакет lure. Modify не должен возвращать ошибку из-за
+// сбоя наживки: ошибка из ModifyResponse — это 502 для клиента.
+type Lures interface {
+	// Prepare правит исходящий запрос: in — запрос клиента, out — копия,
+	// которая уйдёт приложению.
+	Prepare(in, out *http.Request)
+	// Modify правит ответ приложения до того, как он уйдёт клиенту.
+	Modify(resp *http.Response) error
 }
 
 // Stats — счётчики прокси. Атомарные: их увеличивают обработчики запросов,
@@ -190,6 +204,9 @@ func newHandler(upstream *url.URL, o Options, transport http.RoundTripper, idle 
 				o.Stats.ChainBroken.Add(1)
 			}
 			forwarded.SetOutbound(pr.Out.Header, pr.In, client)
+			if o.Lures != nil {
+				o.Lures.Prepare(pr.In, pr.Out)
+			}
 		},
 		Transport:    transport,
 		BufferPool:   newBufferPool(),
@@ -197,6 +214,10 @@ func newHandler(upstream *url.URL, o Options, transport http.RoundTripper, idle 
 		// Сюда ReverseProxy пишет редкие внутренние ошибки, например обрыв
 		// копирования тела ответа. Данных запроса в этих сообщениях нет.
 		ErrorLog: slog.NewLogLogger(o.Logger.Handler(), slog.LevelWarn),
+	}
+
+	if o.Lures != nil {
+		rp.ModifyResponse = o.Lures.Modify
 	}
 
 	// Порядок обёрток — снаружи внутрь:

@@ -92,11 +92,17 @@ func (d *Detector) Inspect(w http.ResponseWriter, r *http.Request) bool {
 			return true
 		}
 		if trap.Accepts(r) {
-			d.touch(r, p, trap.ID, severity(trap.Confidence), map[string]string{
+			data := map[string]string{
 				"decoy_kind": "path",
 				"mode":       string(trap.Mode),
 				"confidence": string(trap.Confidence),
-			})
+			}
+			// Цепочка «наживка → ловушка» (ADR-0027): откуда атакующий
+			// мог узнать этот путь.
+			if id := trap.LureID(); id != "" {
+				data["lure_id"] = id
+			}
+			d.touch(r, p, trap.ID, severity(trap.Confidence), data)
 			if trap.Mode == policy.Enforce {
 				d.Stats.Enforced.Add(1)
 				respond.Trap(w, trap.Response.Status, trap.Response.ContentType, trap.Response.Body)
