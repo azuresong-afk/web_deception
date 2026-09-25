@@ -63,6 +63,8 @@ type appResponse struct {
 	chunked    bool
 	// nilHeader — заголовки — nil-карта: так тест вызывает панику.
 	nilHeader bool
+	// unknownLength — длина тела неизвестна (ContentLength = -1).
+	unknownLength bool
 }
 
 // app — ответ приложения на запрос method path.
@@ -104,6 +106,9 @@ func run(t *testing.T, h *harness, a appResponse) result {
 	}
 	if a.chunked {
 		resp.TransferEncoding = []string{"chunked"}
+	}
+	if a.unknownLength {
+		resp.ContentLength = -1
 	}
 	if err := h.inj.Modify(resp); err != nil {
 		t.Fatal("Modify вернул ошибку: прокси ответил бы 502")

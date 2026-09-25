@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -546,6 +547,112 @@ func TestRunLures(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"decoy_id":"old-admin"`) || !strings.Contains(string(data), `"lure_id":"robots-admin"`) {
 		t.Error("в событиях нет касания с цепочкой robots-admin → old-admin")
+	}
+}
+
+// TestRunHTMLLures — наживки в HTML через настоящий прокси. Приложение
+// сжимает страницу, если ему разрешено: переход по странице должен получить
+// страницу с наживками без сжатия, а запрос из скрипта — ответ приложения
+// как есть.
+func TestRunHTMLLures(t *testing.T) {
+	const page = `<!doctype html><html><head><script>var s = "<body>";</script></head>` +
+		`<body class="app"><main>магазин</main></body></html>`
+	var lastEncoding atomic.Value
+	app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastEncoding.Store(r.Header.Get("Accept-Encoding"))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("ETag", `"v1"`)
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			_, _ = io.WriteString(w, "\x1f\x8b сжатое")
+			return
+		}
+		_, _ = io.WriteString(w, page)
+	}))
+	defer app.Close()
+
+	cfg := testConfig(t, app.URL)
+	dir := t.TempDir()
+	cfg.PolicyFile = filepath.Join(dir, "policy.json")
+	cfg.PolicyCacheFile = filepath.Join(dir, "policy.last-valid.json")
+	policy := `{"schema_version":1,"version":"v1","traps":[` +
+		`{"id":"legacy-login","path":"/account/legacy-login","mode":"enforce","confidence":"medium",` +
+		`"response":{"status":401,"content_type":"text/plain","body":"x"}},` +
+		`{"id":"api-docs","path":"/internal/api/v2/docs","mode":"enforce","confidence":"medium",` +
+		`"response":{"status":200,"content_type":"text/plain","body":"x"}}],` +
+		`"lures":[{"id":"docs-comment","kind":"html_comment","text":"API v2 documentation moved to {path}","trap":"api-docs"},` +
+		`{"id":"legacy-link","kind":"html_link","trap":"legacy-login"}]}`
+	if err := os.WriteFile(cfg.PolicyFile, []byte(policy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addrs, runErr := startSensor(ctx, t, cfg)
+	base := "http://" + addrs.Proxy.String()
+
+	get := func(path string, headers ...string) (http.Header, string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < len(headers); i += 2 {
+			req.Header.Set(headers[i], headers[i+1])
+		}
+		resp, err := (&http.Transport{DisableCompression: true}).RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
+		if readErr != nil || closeErr != nil {
+			t.Fatalf("GET %s: ответ не прочитан", path)
+		}
+		return resp.Header, string(body)
+	}
+
+	// Браузер открывает страницу: разрешает сжатие, но получает страницу
+	// без сжатия и с наживками сразу после <body>.
+	h, body := get("/", "Sec-Fetch-Dest", "document", "Accept-Encoding", "gzip, br")
+	want := `<!doctype html><html><head><script>var s = "<body>";</script></head><body class="app">` +
+		`<!-- API v2 documentation moved to /internal/api/v2/docs -->` +
+		`<a href="/account/legacy-login" hidden aria-hidden="true" tabindex="-1" rel="nofollow"></a>` +
+		`<main>магазин</main></body></html>`
+	if body != want || h.Get("Content-Encoding") != "" || h.Get("Content-Length") != strconv.Itoa(len(want)) ||
+		h.Get("Etag") != `W/"v1"` {
+		t.Errorf("страница: %q\nзаголовки %v", body, h)
+	}
+	if got, _ := lastEncoding.Load().(string); got != "identity" {
+		t.Errorf("приложение получило Accept-Encoding %q", got)
+	}
+
+	// Запрос из скрипта — как есть: сенсор не отключает ему сжатие.
+	if h, body := get("/", "Sec-Fetch-Dest", "empty", "Accept-Encoding", "gzip"); h.Get("Content-Encoding") != "gzip" ||
+		!strings.Contains(body, "сжатое") {
+		t.Errorf("запрос из скрипта изменён: %v", h)
+	}
+
+	// Паук идёт по скрытой ссылке — касание с цепочкой.
+	get("/account/legacy-login")
+
+	_, metricsBody := httpGet(t, "http://"+addrs.Admin.String()+"/metrics")
+	for _, want := range []string{`sensor_lures_total{kind="html"} 1` + "\n", `sensor_lures_skipped_total{reason="html_encoded"} 1` + "\n"} {
+		if !strings.Contains(metricsBody, want) {
+			t.Errorf("в /metrics нет %q", want)
+		}
+	}
+
+	cancel()
+	if err := <-runErr; err != nil {
+		t.Fatalf("остановка: %v", err)
+	}
+	data, err := os.ReadFile(cfg.EventsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"lure_id":"legacy-link"`) {
+		t.Error("в событиях нет касания по скрытой ссылке")
 	}
 }
 
