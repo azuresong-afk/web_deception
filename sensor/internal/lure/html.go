@@ -29,6 +29,12 @@ import (
 // предела, уходит клиенту без изменений и без задержки.
 const maxHTMLHead = 256 << 10
 
+// htmlReserve — память из бюджета (budget.go) на поиск <body> в худшем
+// случае: буфер прочитанного растёт удвоением, у токенизатора — свой
+// буфер под самый длинный токен. Замер — TestEditReserves, около 1,7 МиБ
+// на странице, где весь предел занимает один <script>.
+const htmlReserve = 2 << 20
+
 // isHTMLPage — запрос за страницей: GET, и браузер сообщил, что ждёт
 // документ (Sec-Fetch-Dest), а без этого заголовка — text/html в Accept.
 // Только для таких запросов сенсор просит у приложения ответ без сжатия:
@@ -95,29 +101,35 @@ func bodyInsertOffset(body io.Reader, consumed *bytes.Buffer) (offset int, err e
 }
 
 // injectHTML вставляет фрагмент сразу после <body>. Тело читается
-// в consumed — чтобы при панике, в том числе внутри токенизатора, ответ
+// в e.consumed — чтобы при панике, в том числе внутри токенизатора, ответ
 // можно было собрать обратно.
-func (inj *Injector) injectHTML(resp *http.Response, fragment string, consumed **bytes.Buffer) {
+func (inj *Injector) injectHTML(resp *http.Response, fragment string, e *edit) {
+	if e.mem = inj.mem.lease(htmlReserve); e.mem == nil {
+		inj.Stats.Skipped[SkipMemory].Add(1)
+		return
+	}
 	orig := resp.Body
 	buf := &bytes.Buffer{}
-	*consumed = buf
+	e.consumed = buf
 	offset, err := bodyInsertOffset(orig, buf)
 	read := buf.Bytes()
+	// Буфер токенизатора больше не нужен; до конца отправки клиенту
+	// в памяти остаётся только прочитанное.
+	e.mem.shrink(int64(buf.Cap()))
 	if offset < 0 {
 		// Тега нет, страница оборвалась или больше предела: как есть.
 		if err == nil {
 			inj.Stats.Skipped[SkipHTMLNoBody].Add(1)
 		}
-		resp.Body = readCloser{io.MultiReader(bytes.NewReader(read), errReader{err, orig}), orig}
-		*consumed = nil
+		resp.Body = heldBody{io.MultiReader(bytes.NewReader(read), errReader{err, orig}), orig, e.mem}
+		e.consumed = nil
 		return
 	}
 
-	head := make([]byte, 0, offset+len(fragment))
-	head = append(head, read[:offset]...)
-	head = append(head, fragment...)
-	resp.Body = readCloser{io.MultiReader(bytes.NewReader(head), bytes.NewReader(read[offset:]), orig), orig}
-	*consumed = nil
+	// Вставка — между кусками прочитанного, без копирования страницы.
+	resp.Body = heldBody{io.MultiReader(bytes.NewReader(read[:offset]), strings.NewReader(fragment),
+		bytes.NewReader(read[offset:]), orig), orig, e.mem}
+	e.consumed = nil
 
 	if resp.ContentLength >= 0 {
 		resp.ContentLength += int64(len(fragment))

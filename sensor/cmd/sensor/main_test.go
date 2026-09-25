@@ -642,6 +642,17 @@ func TestRunHTMLLures(t *testing.T) {
 			t.Errorf("в /metrics нет %q", want)
 		}
 	}
+	// Память правки возвращается, когда прокси закрывает тело ответа.
+	// Прокси закрывает его уже после того, как клиент дочитал ответ, —
+	// поэтому ждём, а не проверяем сразу.
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(metricsBody, "sensor_lures_memory_bytes 0\n") {
+		if time.Now().After(deadline) {
+			t.Fatalf("память правки не возвращена:\n%s", metricsBody)
+		}
+		time.Sleep(20 * time.Millisecond)
+		_, metricsBody = httpGet(t, "http://"+addrs.Admin.String()+"/metrics")
+	}
 
 	cancel()
 	if err := <-runErr; err != nil {

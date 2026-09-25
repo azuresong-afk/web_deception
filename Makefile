@@ -132,6 +132,10 @@ test-go:
 	@cd $(SENSOR_DIR) && $(GO) tool cover -func=coverage.out \
 		| awk -v min=$(COVERAGE_MIN) '/^total:/ { gsub("%", "", $$3); \
 			if ($$3 + 0 < min) { printf "покрытие %.1f%% ниже порога %d%%\n", $$3, min; exit 1 } }'
+	@# Замер памяти правки тел — без -race: детектор гонок меняет выделение
+	@# памяти, и под ним замер проверял бы не сенсор (ADR-0028).
+	@echo "==> sensor: замер памяти правки тел"
+	@cd $(SENSOR_DIR) && $(GO) test -count=1 -run '^TestEditReserves$$' ./internal/lure/
 
 test-py:
 	@echo "==> control plane: pytest"

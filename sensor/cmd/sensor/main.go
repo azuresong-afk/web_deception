@@ -413,6 +413,8 @@ func sensorMetrics(events *event.Recorder, stats *proxy.Stats, guard *failopen.G
 			Kind: metrics.Counter, Label: `kind="robots_txt"`, Value: lures.Stats.Robots.Load},
 		metrics.Metric{Name: "sensor_lures_total", Help: "Ответы приложения, получившие наживку, по виду наживки.",
 			Kind: metrics.Counter, Label: `kind="html"`, Value: lures.Stats.HTML.Load},
+		metrics.Metric{Name: "sensor_lures_memory_bytes", Help: "Память, которую держат правки тел ответов до отправки клиенту; предел 32 МиБ.",
+			Kind: metrics.Gauge, Value: lures.EditMemory},
 	)
 	for _, r := range lure.SkipReasons() {
 		ms = append(ms, metrics.Metric{

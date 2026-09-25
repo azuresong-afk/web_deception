@@ -110,11 +110,17 @@ func run(t *testing.T, h *harness, a appResponse) result {
 	if a.unknownLength {
 		resp.ContentLength = -1
 	}
+	memBefore := h.inj.mem.used.Load()
 	if err := h.inj.Modify(resp); err != nil {
 		t.Fatal("Modify вернул ошибку: прокси ответил бы 502")
 	}
 	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	// Память правки возвращена, как только прокси закрыл тело, —
+	// после любой правки, пропуска и паники.
+	if used := h.inj.mem.used.Load(); used != memBefore {
+		t.Errorf("после Close в бюджете занято %d байт, было %d", used, memBefore)
+	}
 	return result{
 		status: resp.StatusCode, header: resp.Header, body: string(body),
 		length: resp.ContentLength, chunked: resp.TransferEncoding != nil, err: err,
