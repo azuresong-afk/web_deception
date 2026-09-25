@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"html"
 	"regexp"
 	"slices"
 	"strconv"
@@ -14,8 +15,8 @@ import (
 //
 // Текст наживки не пишет администратор: он выбирает вид наживки и ловушку,
 // а строку собирает сенсор по шаблону. В ответ сайту клиента из политики
-// попадают только путь ловушки (уже проверенный) и имя заголовка из
-// безопасного набора символов.
+// попадают только путь ловушки (уже проверенный), имя заголовка и текст
+// HTML-комментария — оба из безопасного набора символов (ADR-0027, ADR-0028).
 
 // LureKind — вид наживки.
 type LureKind string
@@ -27,11 +28,21 @@ const (
 	// LureRobots — строка «Disallow: /путь» в robots.txt: честные роботы
 	// путь обходят, а сканеры и атакующие читают robots.txt как карту.
 	LureRobots LureKind = "robots_txt"
+	// LureHTMLComment — HTML-комментарий в начале <body>: «<!-- API v2
+	// documentation moved to /internal/api/v2/docs -->». Такие комментарии
+	// оставляют разработчики, и атакующий читает исходный код страницы.
+	LureHTMLComment LureKind = "html_comment"
+	// LureHTMLLink — скрытая ссылка в начале <body>. Человек её не видит,
+	// а сканеры и пауки, которые обходят все ссылки страницы, находят.
+	LureHTMLLink LureKind = "html_link"
 )
 
 const (
 	maxLures         = 16
 	maxLureHeaderLen = 40
+	maxLureTextLen   = 200
+	// lurePathPlaceholder — место пути ловушки в тексте комментария.
+	lurePathPlaceholder = "{path}"
 )
 
 // Lure — наживка, как она записана в политике.
@@ -43,6 +54,9 @@ type Lure struct {
 	Trap string `json:"trap"`
 	// Header — имя заголовка; только для kind «header».
 	Header string `json:"header"`
+	// Text — текст комментария с {path} на месте пути ловушки; только
+	// для kind «html_comment».
+	Text string `json:"text"`
 
 	// path — путь ловушки; подставляется при разборе политики.
 	path string
@@ -54,6 +68,12 @@ func (l *Lure) Path() string { return l.path }
 var (
 	// Имя заголовка-наживки: «X-» и слова из латиницы и цифр через дефис.
 	lureHeaderRe = regexp.MustCompile(`^X-[A-Za-z0-9]+(-[A-Za-z0-9]+)*$`)
+
+	// Текст HTML-комментария: латиница, цифры, пробел и знаки, которые
+	// ничего не значат внутри комментария. Нет «<», «>», «!» и «&»:
+	// ими комментарий можно закрыть («-->», «--!>») или открыть новый
+	// («<!--»). Двойной дефис запрещён отдельно.
+	lureTextRe = regexp.MustCompile(`^[A-Za-z0-9 .,:;/()_?=+-]*$`)
 
 	// trapRefRe — ссылка на ловушку в теле ответа другой ловушки:
 	// «{{trap:api-export}}» заменяется на путь ловушки api-export.
@@ -124,12 +144,17 @@ func validateLures(p *Policy, ids map[string]bool, add func(string, ...any)) {
 		switch l.Kind {
 		case LureHeader:
 			validateLureHeader(at, l.Header, headers, add)
-		case LureRobots:
-			if l.Header != "" {
-				add("%s.header: только для kind «header»", at)
-			}
+		case LureHTMLComment:
+			validateLureText(at, l.Text, add)
+		case LureRobots, LureHTMLLink:
 		default:
-			add("%s.kind: обязателен, header или robots_txt", at)
+			add("%s.kind: обязателен, header, robots_txt, html_comment или html_link", at)
+		}
+		if l.Kind != LureHeader && l.Header != "" {
+			add("%s.header: только для kind «header»", at)
+		}
+		if l.Kind != LureHTMLComment && l.Text != "" {
+			add("%s.text: только для kind «html_comment»", at)
 		}
 
 		t, ok := traps[l.Trap]
@@ -146,6 +171,10 @@ func validateLures(p *Policy, ids map[string]bool, add func(string, ...any)) {
 			// В robots.txt «*» и «$» — шаблоны, и строка значила бы
 			// не тот путь, что у ловушки.
 			add("%s.trap: путь %q с «*» или «$» в robots.txt означал бы шаблон", at, t.Path)
+		case l.Kind == LureHTMLComment && strings.Contains(t.Path, "--"):
+			// Путь встаёт внутрь комментария; «--» там — ошибка разбора
+			// HTML, и с ним проще не рисковать.
+			add("%s.trap: путь %q с «--» нельзя вставить в HTML-комментарий", at, t.Path)
 		}
 		refer(at+".trap", l.ID, l.Trap)
 	}
@@ -178,6 +207,24 @@ func validateLures(p *Policy, ids map[string]bool, add func(string, ...any)) {
 		if size > maxBodyBytes {
 			add("%s: после подстановки путей больше %d байт", at, maxBodyBytes)
 		}
+	}
+}
+
+// validateLureText проверяет текст HTML-комментария.
+func validateLureText(at, text string, add func(string, ...any)) {
+	rest := strings.Replace(text, lurePathPlaceholder, "", 1)
+	switch {
+	case strings.Count(text, lurePathPlaceholder) != 1:
+		add("%s.text: обязателен и содержит {path} ровно один раз", at)
+	case len(text) > maxLureTextLen:
+		add("%s.text: не длиннее %d байт", at, maxLureTextLen)
+	case !lureTextRe.MatchString(rest):
+		add("%s.text: только латиница, цифры, пробел и . , : ; / ( ) _ ? = + -", at)
+	case strings.Contains(rest, "--") || strings.Contains(text, "-"+lurePathPlaceholder) ||
+		strings.Contains(text, lurePathPlaceholder+"-"):
+		// Путь начинается с «/», но конец пути может быть «-»; дефис рядом
+		// с {path} мог бы дать «--» после подстановки.
+		add("%s.text: без двойного дефиса и дефиса вплотную к {path}", at)
 	}
 }
 
@@ -230,6 +277,16 @@ func compileLures(p *Policy, c *Compiled) {
 			c.headerLures = append(c.headerLures, &l)
 		case LureRobots:
 			c.robotsPaths = append(c.robotsPaths, target.Path)
+		case LureHTMLComment:
+			// Текст и путь проверены: внутри комментария им нечего закрыть.
+			c.htmlFragment += "<!-- " + strings.Replace(l.Text, lurePathPlaceholder, target.Path, 1) + " -->"
+		case LureHTMLLink:
+			// Путь — в атрибуте в двойных кавычках, с экранированием для HTML:
+			// «&» в пути стал бы началом ссылки на символ. Пустой текст ссылки
+			// и hidden — её не видно, даже если стили страницы переопределят
+			// display у ссылок.
+			c.htmlFragment += `<a href="` + html.EscapeString(target.Path) +
+				`" hidden aria-hidden="true" tabindex="-1" rel="nofollow"></a>`
 		}
 	}
 }
@@ -239,6 +296,10 @@ func (c *Compiled) Lures() []*Lure { return c.lures }
 
 // HeaderLures — наживки-заголовки.
 func (c *Compiled) HeaderLures() []*Lure { return c.headerLures }
+
+// HTMLFragment — готовая вставка в начало <body>: комментарии и скрытые
+// ссылки в порядке политики. Пусто — HTML-наживок нет.
+func (c *Compiled) HTMLFragment() string { return c.htmlFragment }
 
 // RobotsDisallow — пути для строк «Disallow» в robots.txt.
 func (c *Compiled) RobotsDisallow() []string { return c.robotsPaths }

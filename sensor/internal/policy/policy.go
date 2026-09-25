@@ -229,6 +229,7 @@ type Compiled struct {
 	lures        []*Lure
 	headerLures  []*Lure
 	robotsPaths  []string
+	htmlFragment string
 }
 
 // Empty — политика без ловушек: обнаружения нет.

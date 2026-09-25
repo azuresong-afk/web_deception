@@ -132,6 +132,10 @@ test-go:
 	@cd $(SENSOR_DIR) && $(GO) tool cover -func=coverage.out \
 		| awk -v min=$(COVERAGE_MIN) '/^total:/ { gsub("%", "", $$3); \
 			if ($$3 + 0 < min) { printf "покрытие %.1f%% ниже порога %d%%\n", $$3, min; exit 1 } }'
+	@# Замер памяти правки тел — без -race: детектор гонок меняет выделение
+	@# памяти, и под ним замер проверял бы не сенсор (ADR-0028).
+	@echo "==> sensor: замер памяти правки тел"
+	@cd $(SENSOR_DIR) && $(GO) test -count=1 -run '^TestEditReserves$$' ./internal/lure/
 
 test-py:
 	@echo "==> control plane: pytest"
@@ -358,6 +362,14 @@ smoke-events:
 		hdrs=$$(curl --silent --show-error --max-time 5 --dump-header - --output /dev/null http://127.0.0.1:8080$$path) && \
 		echo "$$hdrs" | grep -qi '^x-debug-trace: /internal/debug/trace' \
 			|| { echo "нет заголовка-наживки на $$path"; exit 1; }; \
+	done
+	@# Наживки №5 и №6 в HTML (ADR-0028): сразу после <body>, у обеих целей.
+	@# Браузер разрешает сжатие, но страницу с наживками получает без него.
+	@for port in 8080 8081; do \
+		page=$$(curl --fail --silent --show-error --max-time 5 --header 'Sec-Fetch-Dest: document' \
+			--header 'Accept-Encoding: gzip, br' http://127.0.0.1:$$port/) && \
+		echo "$$page" | grep -q '<body[^>]*><a href="/account/legacy-login" hidden aria-hidden="true" tabindex="-1" rel="nofollow"></a><!-- TODO: API v2 documentation moved to /internal/api/v2/docs (internal only) -->' \
+			|| { echo "нет HTML-наживок на порту $$port"; exit 1; }; \
 	done
 	@# Цепочка: касание ловушки из robots.txt записано вместе с наживкой.
 	@test "$$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 http://127.0.0.1:8080/admin-backup)" = 401

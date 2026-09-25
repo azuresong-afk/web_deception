@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "version": "demo-3",
+  "version": "demo-4",
   "traps": [
     {
       "id": "env-file",
@@ -42,6 +42,18 @@
       "id": "old-admin",
       "description": "Учебная ловушка №4: «старая админка» из строки Disallow в robots.txt",
       "path": "/admin-backup",
+      "mode": "enforce",
+      "confidence": "medium",
+      "response": {
+        "status": 401,
+        "content_type": "text/plain",
+        "body": "Unauthorized\n"
+      }
+    },
+    {
+      "id": "legacy-login",
+      "description": "Учебная ловушка №5: «старый вход» из скрытой ссылки в HTML",
+      "path": "/account/legacy-login",
       "mode": "enforce",
       "confidence": "medium",
       "response": {
@@ -113,6 +125,19 @@
       "kind": "header",
       "header": "X-Debug-Trace",
       "trap": "debug-trace"
+    },
+    {
+      "id": "legacy-link",
+      "description": "Учебная наживка №5: скрытая ссылка в начале <body>",
+      "kind": "html_link",
+      "trap": "legacy-login"
+    },
+    {
+      "id": "docs-comment",
+      "description": "Учебная наживка №6: HTML-комментарий «документация API переехала»",
+      "kind": "html_comment",
+      "text": "TODO: API v2 documentation moved to {path} (internal only)",
+      "trap": "api-docs"
     }
   ]
 }
