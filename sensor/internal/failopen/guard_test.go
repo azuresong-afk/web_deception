@@ -169,7 +169,7 @@ func TestPanicPassesRequestThrough(t *testing.T) {
 		t.Fatalf("событий о панике %d, ожидалось 100 уровня high", len(panics))
 	}
 	ev := panics[0]
-	if ev.Client.IP != "203.0.113.7" || ev.Request.Path != "/reset/{hex}" || ev.Data["panic_type"] == "" {
+	if ev.Client.IP != "203.0.113.7" || ev.Request.Path != "/reset/{hex}" || ev.Data["panic_type"] == "" || ev.Data["stage"] != "inspect" {
 		t.Errorf("событие о панике: клиент %+v, запрос %+v, данные %v", ev.Client, ev.Request, ev.Data)
 	}
 

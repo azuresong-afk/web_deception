@@ -559,3 +559,58 @@ func TestTrapResponseHasNoBait(t *testing.T) {
 		t.Errorf("в ответе ловушки наживка: %v", v)
 	}
 }
+
+// TestTouchRecordsLure: касание ловушки, к которой ведёт наживка, говорит,
+// какая именно: так видно, что прочитал атакующий.
+func TestTouchRecordsLure(t *testing.T) {
+	t.Parallel()
+
+	events := &memEvents{}
+	d := New(events, forwarded.NewResolver(nil))
+	d.Swap(mustCompile(t, `{"schema_version":1,"version":"v1","traps":[`+
+		trapJSON("old-admin", "/backup-admin", "enforce", "medium", "x")+`,`+
+		trapJSON("env-file", "/.env", "enforce", "low", "x")+`],`+
+		`"lures":[{"id":"robots-admin","kind":"robots_txt","trap":"old-admin"}]}`))
+
+	d.Inspect(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/backup-admin", nil))
+	d.Inspect(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/.env", nil))
+	touches := events.ofType(event.TypeDecoyTouch)
+	if len(touches) != 2 {
+		t.Fatalf("касаний %d", len(touches))
+	}
+	if touches[0].Data["lure_id"] != "robots-admin" {
+		t.Errorf("касание ловушки с наживкой: %v", touches[0].Data)
+	}
+	if _, ok := touches[1].Data["lure_id"]; ok {
+		t.Errorf("у ловушки без наживки есть lure_id: %v", touches[1].Data)
+	}
+}
+
+// TestTrapResponseCarriesLureHeaders: ответ ловушки несёт те же
+// заголовки-наживки, что и ответы приложения, — иначе ловушку выдало бы
+// сравнение заголовков (T5).
+func TestTrapResponseCarriesLureHeaders(t *testing.T) {
+	t.Parallel()
+
+	d := New(&memEvents{}, forwarded.NewResolver(nil))
+	d.Swap(mustCompile(t, `{"schema_version":1,"version":"v1","traps":[`+
+		trapJSON("debug-trace", "/internal/debug/trace", "enforce", "medium", "x")+`,`+
+		trapJSON("env-file", "/.env", "enforce", "low", "x")+`,`+
+		`{"id":"api","path":"/api/x","mode":"enforce","confidence":"high","methods":["POST"],"preflight_only":true,`+
+		`"response":{"status":200,"content_type":"text/plain","body":"x"}}],`+
+		`"lures":[{"id":"debug-header","kind":"header","header":"X-Debug-Trace","trap":"debug-trace"}]}`))
+
+	rec := httptest.NewRecorder()
+	d.Inspect(rec, httptest.NewRequest(http.MethodGet, "/.env", nil))
+	if rec.Header().Get("X-Debug-Trace") != "/internal/debug/trace" {
+		t.Errorf("ответ ловушки без заголовка-наживки: %v", rec.Header())
+	}
+
+	pre := httptest.NewRequest(http.MethodOptions, "/api/x", nil)
+	pre.Header.Set("Access-Control-Request-Method", "POST")
+	rec = httptest.NewRecorder()
+	d.Inspect(rec, pre)
+	if rec.Code != http.StatusNoContent || rec.Header().Get("X-Debug-Trace") != "/internal/debug/trace" {
+		t.Errorf("отказ в preflight без заголовка-наживки: %d %v", rec.Code, rec.Header())
+	}
+}

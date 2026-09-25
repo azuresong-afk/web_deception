@@ -359,9 +359,22 @@ func TestDemoPolicyValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("учебная политика не проходит проверку: %v", err)
 	}
-	for _, p := range []string{"/.env", "/.git/config", "/backup.sql", "/api/internal/v1/users/export"} {
+	for _, p := range []string{
+		"/.env", "/.git/config", "/backup.sql", "/admin-backup", "/internal/api/v2/docs",
+		"/internal/debug/trace", "/api/internal/v1/users/export",
+	} {
 		if _, ok := c.Match(p); !ok {
 			t.Errorf("в учебной политике нет ловушки %s", p)
+		}
+	}
+	// Цепочки учебного набора: robots.txt → №4, заголовок → №7,
+	// документация №6 → метод №8.
+	for path, lure := range map[string]string{
+		"/admin-backup": "robots-admin", "/internal/debug/trace": "debug-header",
+		"/api/internal/v1/users/export": "api-docs",
+	} {
+		if trap, _ := c.Match(path); trap.LureID() != lure {
+			t.Errorf("к %s ведёт %q, ожидалось %q", path, trap.LureID(), lure)
 		}
 	}
 	if _, ok := c.CookieByName("account_role"); !ok {

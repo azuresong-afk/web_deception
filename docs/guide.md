@@ -88,9 +88,11 @@ Web-deception встраивает в защищаемое веб-приложе
 ([ADR-0023](adr/0023-sensor-events.md)): запуск, остановку, попытки
 `CONNECT`, касания ловушек. Ловушки задаются файлом политики
 ([ADR-0025](adr/0025-policy-format.md), [ADR-0026](adr/0026-cross-site-traps.md)).
-В демо-стенде их пять: учебные `/.env`, `/.git/config`, `/backup.sql`,
+В демо-стенде: учебные ловушки `/.env`, `/.git/config`, `/backup.sql`,
+«старая админка», «переехавшая» документация API, «отладочная» ссылка,
 «внутренний» метод API, который нельзя вызвать с чужого сайта,
-и cookie-ловушка.
+и cookie-ловушка. К части из них ведут наживки — строка в `robots.txt`
+и заголовок ответа ([ADR-0027](adr/0027-lures-header-robots.md)).
 
 Что сенсор при этом делает сам:
 
@@ -204,6 +206,35 @@ Web-deception встраивает в защищаемое веб-приложе
 хранит сам, и ловушки не пропадают даже при перезапуске со сломанным файлом.
 Формат — в ADR-0025.
 
+**Наживки** ([ADR-0027](adr/0027-lures-header-robots.md)). Наживка —
+строка в ответе приложения, которая ведёт к ловушке. Раздел политики
+`lures`; администратор выбирает вид наживки и ловушку, а текст собирает
+сенсор:
+
+- `header` — заголовок, например `X-Debug-Trace: /internal/debug/trace`,
+  на каждом ответе приложения и на ответах самого сенсора. Имя —
+  `X-` и слова из латиницы; заголовки, которые понимают браузеры
+  и прокси (`X-Accel-Redirect`, `X-Robots-Tag`, `X-Frame-Options`
+  и другие), не принимаются;
+- `robots_txt` — строка `Disallow: /путь` в своей группе в конце
+  `robots.txt` приложения, а если его нет (404) — свой `robots.txt`.
+  Ответ `5xx`, сжатый, не `text/plain` или больше 512 КиБ уходит как есть.
+  За `robots.txt` сенсор просит у приложения ответ без сжатия.
+
+Касание ловушки, к которой ведёт наживка, записывает `lure_id`: по нему
+видно, что прочитал атакующий. Тело ответа ловушки может ссылаться
+на другую ловушку — `{{trap:id}}` сенсор заменит её путём. Так фейковая
+документация API ведёт к фейковому методу. К ловушке — не больше одного
+источника. Путь из наживки открывается обычным `GET` и доступен любому,
+кто прочитал сайт, поэтому уверенность таких ловушек не выше `medium`.
+
+Сбой при правке ответа не ломает сайт: ответ приложения уходит как есть,
+а сбой записывается событием `detection.panic` со `stage: lure`. При
+перегрузке обнаружения наживки не ставятся.
+
+Условие `methods` учитывает `X-HTTP-Method-Override`: `POST` с ним
+фреймворки обрабатывают как указанный метод.
+
 **За балансировщиком или CDN.** Задайте в `SENSOR_TRUSTED_PROXIES` адреса
 именно своих прокси, а не всю внутреннюю сеть: любой узел в доверенной
 сети может подставить адрес клиента. Без этой переменной адрес клиента
@@ -249,7 +280,10 @@ Web-deception встраивает в защищаемое веб-приложе
 запросы с изменённой cookie-наживкой (в событиях — одно на клиента
 в минуту); `sensor_cookie_baits_total` — выданные наживки;
 `sensor_preflights_refused_total` — preflight к ловушкам, в которых сенсор
-отказал.
+отказал; `sensor_lures_total{kind=...}` — ответы с наживкой;
+`sensor_lures_skipped_total{reason=...}` — почему наживка не поставлена
+(например, `robots_encoded` — приложение сжало `robots.txt`, несмотря
+на просьбу, `header_exists` — у приложения свой заголовок с тем же именем).
 
 **Где код и в каком порядке читать:**
 
@@ -270,15 +304,17 @@ sensor/internal/policy/file.go         13. чтение политики, ато
 sensor/internal/decoy/decoy.go         14. касание ловушки, cookie-наживка, отказ в preflight
 sensor/internal/decoy/recent.go        15. одно событие о cookie-касании на клиента в минуту
 sensor/internal/decoy/loader.go        16. загрузка, откат на последнюю валидную, SIGHUP
-sensor/internal/event/event.go         17. формат события, что берётся из запроса, Sec-Fetch-*
-sensor/internal/event/mask.go          18. маскирование пути
-sensor/internal/event/recorder.go      19. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
-sensor/internal/event/file.go          20. файл событий и ротация
-sensor/internal/metrics/metrics.go     21. /metrics в формате Prometheus
-sensor/internal/admin/server.go        22. служебный слушатель: фильтр путей, таймауты
-sensor/internal/respond/respond.go     23. ответы сенсора: нейтральные, ловушки, отказ в preflight
-deploy/docker/sensor.Dockerfile        24. как собирается образ, каталог событий
-deploy/policy/demo.json                25. учебная политика: пять ловушек
+sensor/internal/policy/lure.go         17. наживки: проверка, запрещённые заголовки, цепочки {{trap:id}}
+sensor/internal/lure/lure.go           18. правка ответов: заголовок, robots.txt, fail-open
+sensor/internal/event/event.go         19. формат события, что берётся из запроса, Sec-Fetch-*
+sensor/internal/event/mask.go          20. маскирование пути
+sensor/internal/event/recorder.go      21. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
+sensor/internal/event/file.go          22. файл событий и ротация
+sensor/internal/metrics/metrics.go     23. /metrics в формате Prometheus
+sensor/internal/admin/server.go        24. служебный слушатель: фильтр путей, таймауты
+sensor/internal/respond/respond.go     25. ответы сенсора: нейтральные, ловушки, отказ в preflight
+deploy/docker/sensor.Dockerfile        26. как собирается образ, каталог событий
+deploy/policy/demo.json                27. учебная политика: ловушки, наживки, цепочки
 ```
 
 **Граница доверия.** Всё, что приходит по HTTP, враждебно: путь, метод,
@@ -309,6 +345,10 @@ curl -si -X OPTIONS -H 'Origin: https://evil.example' -H 'Access-Control-Request
   http://127.0.0.1:8080/api/internal/v1/users/export
 curl -si -H 'Sec-Fetch-Mode: navigate' http://127.0.0.1:8080/ | grep -i '^set-cookie'   # наживка
 curl -s -o /dev/null -H 'Cookie: account_role=admin' http://127.0.0.1:8080/   # касание cookie-ловушки
+curl -s http://127.0.0.1:8080/robots.txt           # строки Juice Shop и наша группа с Disallow: /admin-backup
+curl -s http://127.0.0.1:8081/robots.txt           # у VulnBank robots.txt нет — отвечает сенсор (make dev-vulnbank)
+curl -sI http://127.0.0.1:8080/ | grep -i x-debug  # заголовок-наживка
+curl -s http://127.0.0.1:8080/internal/api/v2/docs # фейковая документация: путь метода №8
 make dev-events                                   # sensor.started, request.connect_rejected, decoy.touch (path и cookie)
 curl -s http://127.0.0.1:3000/                    # не отвечает: только через сенсор
 make dev-logs                                     # "сенсор запущен", upstream
@@ -328,7 +368,8 @@ curl -s http://127.0.0.1:9090/metrics
 [ADR-0023](adr/0023-sensor-events.md) — события: формат, буфер, файл, метрики,
 [ADR-0024](adr/0024-fail-open.md) — fail-open: паника и перегрузка в обнаружении,
 [ADR-0025](adr/0025-policy-format.md) — политика: формат, проверка, загрузка, ловушки,
-[ADR-0026](adr/0026-cross-site-traps.md) — ловушки, которые нельзя вызвать с чужого сайта.
+[ADR-0026](adr/0026-cross-site-traps.md) — ловушки, которые нельзя вызвать с чужого сайта,
+[ADR-0027](adr/0027-lures-header-robots.md) — наживки в заголовке и robots.txt, цепочки.
 **Угрозы:** T1, T2, T3, T4, T5, T7, T17, T18, T19 в [модели угроз](threat-model.md).
 
 ---
@@ -540,7 +581,7 @@ Workflow `.github/workflows/ci.yml` запускается на каждый PR 
 |---|---|
 | `make lint` | golangci-lint для Go (включая gosec), ruff и mypy для Python, политику контейнеров, actionlint для workflow |
 | `make test` | тесты Go с детектором гонок, тесты Python, тесты скриптов, пороги покрытия |
-| `make smoke` | поднимает стек с Juice Shop и VulnBank за сенсорами, проверяет готовность, что запросы через сенсоры доходят до приложений, что попытка `CONNECT` и касание ловушки записаны в файл событий внутри контейнера, что ловушки отвечают вместо приложений, отсутствие shell в образах, останавливает |
+| `make smoke` | поднимает стек с Juice Shop и VulnBank за сенсорами, проверяет готовность, что запросы через сенсоры доходят до приложений, что попытка `CONNECT` и касание ловушки записаны в файл событий внутри контейнера, что ловушки отвечают вместо приложений, что наживки стоят в `robots.txt` и заголовках обеих целей и цепочка «наживка → ловушка» записана, отсутствие shell в образах, останавливает |
 | `make check-images` | в собранных образах продукта не запускаются `sh`, `bash`, `perl`, `apt-get`, `pip`, `curl`, `wget` |
 | `make hooks` | включает git-хуки в этом клоне — один раз |
 | `make test-hooks` | проверяет хуки настоящими коммитами во временном репозитории |

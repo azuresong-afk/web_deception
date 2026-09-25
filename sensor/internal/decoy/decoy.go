@@ -88,17 +88,25 @@ func (d *Detector) Inspect(w http.ResponseWriter, r *http.Request) bool {
 			// «непростой» запрос с чужого сайта. Сам preflight — не касание:
 			// его браузер отправляет автоматически (ADR-0026).
 			d.Stats.PreflightsRefused.Add(1)
+			addLureHeaders(w, p)
 			respond.RefusePreflight(w)
 			return true
 		}
 		if trap.Accepts(r) {
-			d.touch(r, p, trap.ID, severity(trap.Confidence), map[string]string{
+			data := map[string]string{
 				"decoy_kind": "path",
 				"mode":       string(trap.Mode),
 				"confidence": string(trap.Confidence),
-			})
+			}
+			// Цепочка «наживка → ловушка» (ADR-0027): откуда атакующий
+			// мог узнать этот путь.
+			if id := trap.LureID(); id != "" {
+				data["lure_id"] = id
+			}
+			d.touch(r, p, trap.ID, severity(trap.Confidence), data)
 			if trap.Mode == policy.Enforce {
 				d.Stats.Enforced.Add(1)
+				addLureHeaders(w, p)
 				respond.Trap(w, trap.Response.Status, trap.Response.ContentType, trap.Response.Body)
 				return true
 			}
@@ -108,6 +116,15 @@ func (d *Detector) Inspect(w http.ResponseWriter, r *http.Request) bool {
 
 	d.setBaits(w, r, p, present)
 	return false
+}
+
+// addLureHeaders ставит заголовки-наживки и на ответ сенсора. Их несёт
+// каждый ответ приложения, и ответ ловушки без них выдавал бы ловушку
+// тому, кто сравнивает заголовки (T5, ADR-0027).
+func addLureHeaders(w http.ResponseWriter, p *policy.Compiled) {
+	for _, l := range p.HeaderLures() {
+		w.Header().Set(l.Header, l.Path())
+	}
 }
 
 // touch записывает касание ловушки. Ключи data — константы из кода.

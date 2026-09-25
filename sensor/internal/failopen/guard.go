@@ -165,7 +165,7 @@ func (g *Guard) inspect(w http.ResponseWriter, r *http.Request) (handled, panick
 			panic(p)
 		}
 		handled, panicked = false, true
-		g.onPanic(r, p)
+		g.RecordPanic(r, p, "inspect")
 	}()
 
 	handled = g.cfg.Detector.Inspect(w, r)
@@ -180,9 +180,12 @@ func (g *Guard) inspect(w http.ResponseWriter, r *http.Request) (handled, panick
 	return handled, false
 }
 
-// onPanic записывает панику: счётчик, событие с адресом клиента и —
-// не чаще раза в минуту — стек в лог.
-func (g *Guard) onPanic(r *http.Request, p any) {
+// RecordPanic записывает панику в обнаружении: счётчик, событие с адресом
+// клиента и — не чаще раза в минуту — стек в лог. stage — где случилась:
+// «inspect» (проверка запроса) или «lure» (наживка в ответе, ADR-0027).
+// Одно место на весь сенсор: иначе предел на стек в логе и счётчик
+// разошлись бы.
+func (g *Guard) RecordPanic(r *http.Request, p any, stage string) {
 	g.Stats.Panics.Add(1)
 
 	// Паника на чужом вводе — повод посмотреть, кто его прислал: это может
@@ -192,7 +195,7 @@ func (g *Guard) onPanic(r *http.Request, p any) {
 	ev := event.New(event.TypeDetectionPanic, event.SeverityHigh)
 	ev.Client = event.ClientFrom(g.cfg.Trust.Resolve(r))
 	ev.Request = event.RequestFrom(r)
-	ev.Data = map[string]string{"panic_type": fmt.Sprintf("%T", p)}
+	ev.Data = map[string]string{"panic_type": fmt.Sprintf("%T", p), "stage": stage}
 	g.cfg.Events.Emit(ev)
 
 	now := g.cfg.Now().Unix()
@@ -202,7 +205,8 @@ func (g *Guard) onPanic(r *http.Request, p any) {
 	}
 	// Стек — имена функций и строки кода, без данных запроса. Нужен, чтобы
 	// найти ошибку; значение паники не пишем по той же причине, что и выше.
-	g.cfg.Logger.Error("паника в обнаружении: запрос пропущен в приложение без проверки",
+	g.cfg.Logger.Error("паника в обнаружении: запрос пропущен без проверки, ответ — без изменений",
+		slog.String("stage", stage),
 		slog.String("panic_type", fmt.Sprintf("%T", p)),
 		slog.String("stack", string(debug.Stack())))
 }

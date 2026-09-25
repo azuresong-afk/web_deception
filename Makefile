@@ -344,13 +344,31 @@ smoke-events:
 		echo "$$hdrs" | grep -qi '^set-cookie: account_role=customer; Path=/; HttpOnly; SameSite=Strict' \
 			|| { echo "нет cookie-наживки на порту $$port"; exit 1; }; \
 	done
+	@# Наживки №4 и №7 (ADR-0027). robots.txt Juice Shop дополнен, его
+	@# строки на месте; у VulnBank robots.txt нет — сенсор отвечает своим.
+	@# Клиент разрешает сжатие, но сенсор просит robots.txt без него.
+	@body=$$(curl --fail --silent --show-error --max-time 5 --header 'Accept-Encoding: gzip, br' \
+		http://127.0.0.1:8080/robots.txt) && \
+		echo "$$body" | grep -q '^Disallow: /ftp$$' && echo "$$body" | grep -q '^Disallow: /admin-backup$$'
+	@body=$$(curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8081/robots.txt) && \
+		echo "$$body" | grep -q '^Disallow: /admin-backup$$'
+	@# Заголовок-наживка — и на ответе приложения, и на ответе ловушки:
+	@# иначе ловушку выдало бы сравнение заголовков.
+	@for path in / /.env; do \
+		hdrs=$$(curl --silent --show-error --max-time 5 --dump-header - --output /dev/null http://127.0.0.1:8080$$path) && \
+		echo "$$hdrs" | grep -qi '^x-debug-trace: /internal/debug/trace' \
+			|| { echo "нет заголовка-наживки на $$path"; exit 1; }; \
+	done
+	@# Цепочка: касание ловушки из robots.txt записано вместе с наживкой.
+	@test "$$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 5 http://127.0.0.1:8080/admin-backup)" = 401
 	@for i in 1 2 3 4 5; do \
 		ev=$$($(COMPOSE) --profile demo cp sensor-juice:/var/lib/sensor/events.jsonl - 2>/dev/null | tar -xO); \
-		echo "$$ev" | grep -q '"decoy_id":"env-file"' && echo "$$ev" | grep -q '"decoy_id":"api-export"' && break; \
+		echo "$$ev" | grep -q '"decoy_id":"env-file"' && echo "$$ev" | grep -q '"decoy_id":"api-export"' && \
+			echo "$$ev" | grep -q '"lure_id":"robots-admin"' && break; \
 		if [ "$$i" -eq 5 ]; then echo "касание ловушки не появилось в файле событий"; exit 1; fi; \
 		sleep 1; \
 	done
-	@echo "==> ловушки отвечают вместо приложений, касание записано, preflight не одобрен, наживка выдана"
+	@echo "==> ловушки отвечают вместо приложений, касание записано, preflight не одобрен, наживки на месте"
 
 dev: secrets ## Поднять control plane, PostgreSQL и NATS и дождаться готовности
 	VERSION=$(VERSION) $(COMPOSE) up --build --detach --wait
