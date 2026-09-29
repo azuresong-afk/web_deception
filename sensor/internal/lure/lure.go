@@ -1,20 +1,22 @@
 // Package lure — наживки в ответах приложения: строки, которые ведут
-// атакующего к ловушкам (ADR-0027).
+// атакующего к ловушкам (ADR-0027, ADR-0028).
 //
 // Наживка — не ответ вместо приложения, а правка его ответа: сенсор
-// добавляет заголовок или строки в robots.txt. Поэтому правила здесь
-// строже, чем у ловушек:
+// добавляет заголовок, строки в robots.txt, комментарий и скрытую ссылку
+// в HTML (html.go). Поэтому правила здесь строже, чем у ловушек:
 //   - текст наживки собирается сенсором по шаблону, из политики в ответ
 //     попадают только путь ловушки и имя заголовка — оба проверены
 //     при разборе политики (T15);
 //   - правка — fail-open: паника или неожиданный ответ приложения —
 //     ответ уходит клиенту как есть, а паника записывается событием;
 //   - в режиме частичного обнаружения (ADR-0024) наживки не ставятся:
-//     это тоже работа обнаружения.
+//     это тоже работа обнаружения;
+//   - все правки тел вместе укладываются в общий бюджет памяти
+//     (budget.go): нет бюджета — ответ уходит без наживки.
 //
 // Граница доверия: ответ приложения доверенный лишь частично — в нём
-// может быть то, что сохранил атакующий. Тело robots.txt читается
-// с пределом, заголовки только сравниваются.
+// может быть то, что сохранил атакующий. Тело robots.txt и начало
+// страницы читаются с пределом, заголовки только сравниваются.
 package lure
 
 import (
@@ -31,6 +33,11 @@ import (
 // maxRobotsBytes — самый большой robots.txt, который сенсор дополняет.
 // Google читает только первые 500 КиБ; больше — ответ уходит как есть.
 const maxRobotsBytes = 512 << 10
+
+// robotsReserve — память из бюджета (budget.go) на дополнение robots.txt
+// в худшем случае: буфер прочитанного растёт удвоением, новое тело
+// собирается копией. Замер — TestEditReserves, около 3,2 МиБ.
+const robotsReserve = 4 << 20
 
 // robotsPath — путь robots.txt. Роботы запрашивают ровно его.
 const robotsPath = "/robots.txt"
@@ -52,6 +59,17 @@ const (
 	SkipRobotsEncoded
 	// SkipRobotsTooLarge — robots.txt больше maxRobotsBytes.
 	SkipRobotsTooLarge
+	// SkipHTMLEncoded — страница сжата, хотя сенсор просил без сжатия
+	// (или запрос не похож на переход по странице, и сенсор не просил).
+	SkipHTMLEncoded
+	// SkipHTMLNoBody — в первых maxHTMLHead байтах страницы нет <body>.
+	SkipHTMLNoBody
+	// SkipHTMLNotPage — text/html, но не страница для браузера: файл
+	// на скачивание, часть файла, UTF-16 или UTF-32.
+	SkipHTMLNotPage
+	// SkipMemory — бюджет памяти правки тел занят (budget.go): ответ
+	// ушёл без наживки.
+	SkipMemory
 	// SkipPanic — паника при правке ответа; ответ ушёл как есть.
 	SkipPanic
 	numSkipReasons
@@ -65,6 +83,10 @@ var skipNames = [numSkipReasons]string{
 	SkipRobotsNotText:  "robots_not_text",
 	SkipRobotsEncoded:  "robots_encoded",
 	SkipRobotsTooLarge: "robots_too_large",
+	SkipHTMLEncoded:    "html_encoded",
+	SkipHTMLNoBody:     "html_no_body",
+	SkipHTMLNotPage:    "html_not_page",
+	SkipMemory:         "memory",
 	SkipPanic:          "panic",
 }
 
@@ -87,6 +109,8 @@ type Stats struct {
 	// Robots — ответы на robots.txt со строками-наживками: дополненные
 	// или созданные вместо 404.
 	Robots atomic.Uint64
+	// HTML — страницы с наживками в <body>.
+	HTML atomic.Uint64
 	// Skipped — наживки, которые не поставлены, по причине.
 	Skipped [numSkipReasons]atomic.Uint64
 }
@@ -106,6 +130,7 @@ type Config struct {
 type Injector struct {
 	cfg   Config
 	Stats Stats
+	mem   memBudget
 }
 
 // New создаёт Injector.
@@ -123,13 +148,27 @@ func New(cfg Config) *Injector {
 // robots.txt не дополнить, а на условный запрос приложение ответило бы 304,
 // и клиент остался бы с копией без наживок. robots.txt — несколько сотен
 // байт, и лишний трафик здесь ничего не стоит.
+//
+// За страницей HTML сенсор тоже просит ответ без сжатия: Brotli в стандартной
+// библиотеке Go не распаковать, а вставить наживку в сжатую страницу нельзя.
+// Условия здесь остаются: на 304 браузер покажет страницу из своего кэша,
+// а её он получил от сенсора — с наживкой (ADR-0028).
 func (inj *Injector) Prepare(in, out *http.Request) {
-	if !isRobots(in) || len(inj.cfg.Policy().RobotsDisallow()) == 0 || inj.cfg.Degraded() {
+	if inj.cfg.Degraded() {
 		return
 	}
-	out.Header.Set("Accept-Encoding", "identity")
-	for _, h := range []string{"If-None-Match", "If-Modified-Since", "If-Match", "If-Unmodified-Since", "If-Range", "Range"} {
-		out.Header.Del(h)
+	p := inj.cfg.Policy()
+	switch {
+	case isRobots(in):
+		if len(p.RobotsDisallow()) == 0 {
+			return
+		}
+		out.Header.Set("Accept-Encoding", "identity")
+		for _, h := range []string{"If-None-Match", "If-Modified-Since", "If-Match", "If-Unmodified-Since", "If-Range", "Range"} {
+			out.Header.Del(h)
+		}
+	case p.HTMLFragment() != "" && isHTMLPage(in):
+		out.Header.Set("Accept-Encoding", "identity")
 	}
 }
 
@@ -148,24 +187,48 @@ func (inj *Injector) Modify(resp *http.Response) error {
 
 	// Тело читается до правки. Если правка упадёт, ответ собирается
 	// обратно из прочитанного и непрочитанного — клиент получит его
-	// как есть.
+	// как есть. Буфер прочитанного заводится до чтения, поэтому он виден
+	// здесь, даже если паника случится посреди чтения — например, внутри
+	// токенизатора HTML на странице, которую тот не ожидал. Занятая
+	// правкой память возвращается сразу: собранное здесь тело её
+	// не вернёт.
 	orig := resp.Body
-	var consumed []byte
+	var e edit
 	defer func() {
 		if rec := recover(); rec != nil {
 			inj.Stats.Skipped[SkipPanic].Add(1)
-			if consumed != nil {
-				resp.Body = readCloser{io.MultiReader(bytes.NewReader(consumed), orig), orig}
+			if e.mem != nil {
+				e.mem.release()
+			}
+			if e.consumed != nil {
+				resp.Body = readCloser{io.MultiReader(bytes.NewReader(e.consumed.Bytes()), orig), orig}
 			}
 			inj.cfg.OnPanic(resp.Request, rec, "lure")
 		}
 	}()
 
 	inj.addHeaders(resp, p)
-	if resp.Request != nil && isRobots(resp.Request) && len(p.RobotsDisallow()) > 0 {
-		inj.robots(resp, p.RobotsDisallow(), &consumed)
+	switch {
+	case resp.Request != nil && isRobots(resp.Request):
+		if len(p.RobotsDisallow()) > 0 {
+			inj.robots(resp, p.RobotsDisallow(), &e)
+		}
+	case p.HTMLFragment() != "":
+		if ok, reason := htmlEligible(resp); ok {
+			inj.injectHTML(resp, p.HTMLFragment(), &e)
+		} else if reason >= 0 {
+			inj.Stats.Skipped[reason].Add(1)
+		}
 	}
 	return nil
+}
+
+// edit — чтение тела одной правкой: что прочитано и сколько памяти
+// занято. Живёт в Modify, чтобы при панике ответ можно было собрать
+// обратно, а память — вернуть.
+type edit struct {
+	consumed *bytes.Buffer
+	mem      *lease
 }
 
 // addHeaders добавляет заголовки-наживки. Заголовок, который уже есть
@@ -188,9 +251,9 @@ func (inj *Injector) addHeaders(resp *http.Response, p *policy.Compiled) {
 }
 
 // robots дополняет robots.txt строками «Disallow» или создаёт его вместо
-// 404. Прочитанное тело сразу кладётся в consumed — чтобы при панике
-// ответ можно было собрать обратно.
-func (inj *Injector) robots(resp *http.Response, paths []string, consumed *[]byte) {
+// 404. Тело читается в e.consumed — чтобы при панике ответ можно было
+// собрать обратно.
+func (inj *Injector) robots(resp *http.Response, paths []string, e *edit) {
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotFound:
@@ -223,18 +286,25 @@ func (inj *Injector) robots(resp *http.Response, paths []string, consumed *[]byt
 		return
 	}
 
+	if e.mem = inj.mem.lease(robotsReserve); e.mem == nil {
+		inj.Stats.Skipped[SkipMemory].Add(1)
+		return
+	}
 	orig := resp.Body
-	data, err := io.ReadAll(io.LimitReader(orig, maxRobotsBytes+1))
-	*consumed = data
+	buf := &bytes.Buffer{}
+	e.consumed = buf
+	_, err := buf.ReadFrom(io.LimitReader(orig, maxRobotsBytes+1))
+	data := buf.Bytes()
 	if err != nil || len(data) > maxRobotsBytes {
 		// Больше предела или обрыв: отдаём как есть — прочитанное
 		// и остаток, ошибка чтения дойдёт до клиента так же, как без
-		// сенсора.
+		// сенсора. Прочитанное ждёт отправки — за ним числится память.
 		if err == nil {
 			inj.Stats.Skipped[SkipRobotsTooLarge].Add(1)
 		}
-		resp.Body = readCloser{io.MultiReader(bytes.NewReader(data), errReader{err, orig}), orig}
-		*consumed = nil
+		e.mem.shrink(int64(buf.Cap()))
+		resp.Body = heldBody{io.MultiReader(bytes.NewReader(data), errReader{err, orig}), orig, e.mem}
+		e.consumed = nil
 		return
 	}
 
@@ -253,6 +323,9 @@ func (inj *Injector) robots(resp *http.Response, paths []string, consumed *[]byt
 	// когда новое тело готово.
 	_ = orig.Close()
 	setBody(resp, b.String())
+	// Прочитанное больше не нужно; ждёт отправки только новое тело.
+	e.mem.shrink(resp.ContentLength)
+	resp.Body = heldBody{resp.Body, resp.Body, e.mem}
 	// Валидаторы описывали другие байты: ETag и сводки содержимого
 	// убираем, иначе кэш принял бы наш ответ за ответ приложения.
 	for _, h := range []string{"ETag", "Content-MD5", "Digest", "Content-Digest", "Repr-Digest"} {

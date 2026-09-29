@@ -360,20 +360,26 @@ func TestDemoPolicyValid(t *testing.T) {
 		t.Fatalf("учебная политика не проходит проверку: %v", err)
 	}
 	for _, p := range []string{
-		"/.env", "/.git/config", "/backup.sql", "/admin-backup", "/internal/api/v2/docs",
+		"/.env", "/.git/config", "/backup.sql", "/admin-backup", "/account/legacy-login", "/internal/api/v2/docs",
 		"/internal/debug/trace", "/api/internal/v1/users/export",
 	} {
 		if _, ok := c.Match(p); !ok {
 			t.Errorf("в учебной политике нет ловушки %s", p)
 		}
 	}
-	// Цепочки учебного набора: robots.txt → №4, заголовок → №7,
-	// документация №6 → метод №8.
+	// Цепочки учебного набора: robots.txt → №4, скрытая ссылка → №5,
+	// комментарий → документация №6 → метод №8, заголовок → №7.
 	for path, lure := range map[string]string{
-		"/admin-backup": "robots-admin", "/internal/debug/trace": "debug-header",
+		"/admin-backup": "robots-admin", "/account/legacy-login": "legacy-link",
+		"/internal/api/v2/docs": "docs-comment", "/internal/debug/trace": "debug-header",
 		"/api/internal/v1/users/export": "api-docs",
 	} {
-		if trap, _ := c.Match(path); trap.LureID() != lure {
+		trap, ok := c.Match(path)
+		if !ok {
+			t.Errorf("в учебной политике нет ловушки %s", path)
+			continue
+		}
+		if trap.LureID() != lure {
 			t.Errorf("к %s ведёт %q, ожидалось %q", path, trap.LureID(), lure)
 		}
 	}

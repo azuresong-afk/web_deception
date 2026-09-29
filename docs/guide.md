@@ -89,10 +89,11 @@ Web-deception встраивает в защищаемое веб-приложе
 `CONNECT`, касания ловушек. Ловушки задаются файлом политики
 ([ADR-0025](adr/0025-policy-format.md), [ADR-0026](adr/0026-cross-site-traps.md)).
 В демо-стенде: учебные ловушки `/.env`, `/.git/config`, `/backup.sql`,
-«старая админка», «переехавшая» документация API, «отладочная» ссылка,
-«внутренний» метод API, который нельзя вызвать с чужого сайта,
-и cookie-ловушка. К части из них ведут наживки — строка в `robots.txt`
-и заголовок ответа ([ADR-0027](adr/0027-lures-header-robots.md)).
+«старая админка», «старый вход», «переехавшая» документация API,
+«отладочная» ссылка, «внутренний» метод API, который нельзя вызвать
+с чужого сайта, и cookie-ловушка. К части из них ведут наживки — строка
+в `robots.txt`, заголовок ответа ([ADR-0027](adr/0027-lures-header-robots.md)),
+комментарий и скрытая ссылка в HTML ([ADR-0028](adr/0028-html-lures.md)).
 
 Что сенсор при этом делает сам:
 
@@ -219,7 +220,34 @@ Web-deception встраивает в защищаемое веб-приложе
 - `robots_txt` — строка `Disallow: /путь` в своей группе в конце
   `robots.txt` приложения, а если его нет (404) — свой `robots.txt`.
   Ответ `5xx`, сжатый, не `text/plain` или больше 512 КиБ уходит как есть.
-  За `robots.txt` сенсор просит у приложения ответ без сжатия.
+  За `robots.txt` сенсор просит у приложения ответ без сжатия;
+- `html_link` — скрытая ссылка сразу после `<body>`:
+  `<a href="/путь" hidden aria-hidden="true" tabindex="-1" rel="nofollow"></a>`.
+  Человек её не видит, пауки и сканеры находят
+  ([ADR-0028](adr/0028-html-lures.md));
+- `html_comment` — комментарий сразу после `<body>`, текст задаёт поле
+  `text` с `{path}` на месте пути ловушки: `<!-- TODO: API v2
+  documentation moved to /internal/api/v2/docs (internal only) -->`.
+  В тексте — только латиница, цифры, пробел и `. , : ; / ( ) _ ? = + -`,
+  без `--`: закрыть комментарий и вставить свою разметку нельзя.
+
+**Наживки в HTML.** Место вставки ищет токенизатор HTML5
+(`golang.org/x/net/html`), поэтому `<body>` внутри скрипта, комментария
+или атрибута его не собьёт; остальные байты страницы не меняются.
+Правится только ответ `GET 200 text/html`, и только если `<body>` —
+в первых 256 КиБ. За страницей при переходе (`Sec-Fetch-Dest: document`)
+сенсор просит у приложения ответ без сжатия, поэтому такие страницы уходят
+клиенту несжатыми: у Juice Shop 9,6 КБ вместо 2,9 КБ. **Рекомендация:**
+пусть сжимает прокси или CDN перед сенсором. `ETag` страницы становится
+слабым (`W/"..."`): повторные запросы по-прежнему получают `304`.
+Ссылка-наживка становится первым элементом `<body>`. Стили вида
+`body > div:first-child` и скрипты, которые берут первый элемент тела,
+её увидят, поэтому HTML-наживки сначала проверяйте на копии сайта.
+
+Правки тел — HTML и `robots.txt` — укладываются в общий бюджет памяти
+32 МиБ. Если его заняли медленные клиенты, ответ уходит без наживки
+(`sensor_lures_skipped_total{reason="memory"}`): страдают наживки,
+а не сайт.
 
 Касание ловушки, к которой ведёт наживка, записывает `lure_id`: по нему
 видно, что прочитал атакующий. Тело ответа ловушки может ссылаться
@@ -283,7 +311,12 @@ Web-deception встраивает в защищаемое веб-приложе
 отказал; `sensor_lures_total{kind=...}` — ответы с наживкой;
 `sensor_lures_skipped_total{reason=...}` — почему наживка не поставлена
 (например, `robots_encoded` — приложение сжало `robots.txt`, несмотря
-на просьбу, `header_exists` — у приложения свой заголовок с тем же именем).
+на просьбу, `header_exists` — у приложения свой заголовок с тем же именем,
+`html_encoded` — страница сжата, `html_no_body` — нет `<body>` в первых
+256 КиБ, `html_not_page` — файл на скачивание, часть файла или UTF-16,
+`memory` — занят бюджет памяти правки тел);
+`sensor_lures_memory_bytes` — сколько памяти сейчас держат правки тел:
+в покое 0, стоит у 32 МиБ — наживки пропускаются.
 
 **Где код и в каком порядке читать:**
 
@@ -306,15 +339,17 @@ sensor/internal/decoy/recent.go        15. одно событие о cookie-к�
 sensor/internal/decoy/loader.go        16. загрузка, откат на последнюю валидную, SIGHUP
 sensor/internal/policy/lure.go         17. наживки: проверка, запрещённые заголовки, цепочки {{trap:id}}
 sensor/internal/lure/lure.go           18. правка ответов: заголовок, robots.txt, fail-open
-sensor/internal/event/event.go         19. формат события, что берётся из запроса, Sec-Fetch-*
-sensor/internal/event/mask.go          20. маскирование пути
-sensor/internal/event/recorder.go      21. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
-sensor/internal/event/file.go          22. файл событий и ротация
-sensor/internal/metrics/metrics.go     23. /metrics в формате Prometheus
-sensor/internal/admin/server.go        24. служебный слушатель: фильтр путей, таймауты
-sensor/internal/respond/respond.go     25. ответы сенсора: нейтральные, ловушки, отказ в preflight
-deploy/docker/sensor.Dockerfile        26. как собирается образ, каталог событий
-deploy/policy/demo.json                27. учебная политика: ловушки, наживки, цепочки
+sensor/internal/lure/html.go           19. правка HTML: какой ответ, где <body>, вставка без пересборки
+sensor/internal/lure/budget.go         20. общий бюджет памяти правки тел
+sensor/internal/event/event.go         21. формат события, что берётся из запроса, Sec-Fetch-*
+sensor/internal/event/mask.go          22. маскирование пути
+sensor/internal/event/recorder.go      23. буфер: никогда не ждать, вытеснять старое, приоритет sensor.*
+sensor/internal/event/file.go          24. файл событий и ротация
+sensor/internal/metrics/metrics.go     25. /metrics в формате Prometheus
+sensor/internal/admin/server.go        26. служебный слушатель: фильтр путей, таймауты
+sensor/internal/respond/respond.go     27. ответы сенсора: нейтральные, ловушки, отказ в preflight
+deploy/docker/sensor.Dockerfile        28. как собирается образ: зависимости по go.sum, каталог событий
+deploy/policy/demo.json                29. учебная политика: ловушки, наживки, цепочки
 ```
 
 **Граница доверия.** Всё, что приходит по HTTP, враждебно: путь, метод,
@@ -348,6 +383,9 @@ curl -s -o /dev/null -H 'Cookie: account_role=admin' http://127.0.0.1:8080/   # 
 curl -s http://127.0.0.1:8080/robots.txt           # строки Juice Shop и наша группа с Disallow: /admin-backup
 curl -s http://127.0.0.1:8081/robots.txt           # у VulnBank robots.txt нет — отвечает сенсор (make dev-vulnbank)
 curl -sI http://127.0.0.1:8080/ | grep -i x-debug  # заголовок-наживка
+# наживки в HTML — сразу после <body>; браузер разрешает сжатие, но страница приходит без него
+curl -s -H 'Sec-Fetch-Dest: document' -H 'Accept-Encoding: gzip, br' http://127.0.0.1:8080/ | grep -o '<body[^>]*>.\{0,200\}'
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/account/legacy-login   # 401: путь скрытой ссылки
 curl -s http://127.0.0.1:8080/internal/api/v2/docs # фейковая документация: путь метода №8
 make dev-events                                   # sensor.started, request.connect_rejected, decoy.touch (path и cookie)
 curl -s http://127.0.0.1:3000/                    # не отвечает: только через сенсор
@@ -369,8 +407,9 @@ curl -s http://127.0.0.1:9090/metrics
 [ADR-0024](adr/0024-fail-open.md) — fail-open: паника и перегрузка в обнаружении,
 [ADR-0025](adr/0025-policy-format.md) — политика: формат, проверка, загрузка, ловушки,
 [ADR-0026](adr/0026-cross-site-traps.md) — ловушки, которые нельзя вызвать с чужого сайта,
-[ADR-0027](adr/0027-lures-header-robots.md) — наживки в заголовке и robots.txt, цепочки.
-**Угрозы:** T1, T2, T3, T4, T5, T7, T17, T18, T19 в [модели угроз](threat-model.md).
+[ADR-0027](adr/0027-lures-header-robots.md) — наживки в заголовке и robots.txt, цепочки,
+[ADR-0028](adr/0028-html-lures.md) — наживки в HTML, бюджет памяти, зависимость `golang.org/x/net`.
+**Угрозы:** T1, T2, T3, T4, T5, T7, T12, T15, T17, T18, T19 в [модели угроз](threat-model.md).
 
 ---
 
@@ -581,7 +620,7 @@ Workflow `.github/workflows/ci.yml` запускается на каждый PR 
 |---|---|
 | `make lint` | golangci-lint для Go (включая gosec), ruff и mypy для Python, политику контейнеров, actionlint для workflow |
 | `make test` | тесты Go с детектором гонок, тесты Python, тесты скриптов, пороги покрытия |
-| `make smoke` | поднимает стек с Juice Shop и VulnBank за сенсорами, проверяет готовность, что запросы через сенсоры доходят до приложений, что попытка `CONNECT` и касание ловушки записаны в файл событий внутри контейнера, что ловушки отвечают вместо приложений, что наживки стоят в `robots.txt` и заголовках обеих целей и цепочка «наживка → ловушка» записана, отсутствие shell в образах, останавливает |
+| `make smoke` | поднимает стек с Juice Shop и VulnBank за сенсорами, проверяет готовность, что запросы через сенсоры доходят до приложений, что попытка `CONNECT` и касание ловушки записаны в файл событий внутри контейнера, что ловушки отвечают вместо приложений, что наживки стоят в `robots.txt`, заголовках и HTML обеих целей и цепочка «наживка → ловушка» записана, отсутствие shell в образах, останавливает |
 | `make check-images` | в собранных образах продукта не запускаются `sh`, `bash`, `perl`, `apt-get`, `pip`, `curl`, `wget` |
 | `make hooks` | включает git-хуки в этом клоне — один раз |
 | `make test-hooks` | проверяет хуки настоящими коммитами во временном репозитории |

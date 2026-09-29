@@ -111,7 +111,11 @@ func TestLuresReject(t *testing.T) {
 		{"id занят ловушкой", withLures(`{"id":"old-admin","kind":"robots_txt","trap":"old-admin"}`), "уже есть"},
 		{"две наживки к одной ловушке", withLures(`{"id":"a","kind":"robots_txt","trap":"old-admin"},` +
 			`{"id":"b","kind":"header","header":"X-Old","trap":"old-admin"}`), "уже ведёт"},
-		{"неизвестное поле", withLures(`{"id":"x","kind":"robots_txt","trap":"old-admin","text":"<script>"}`), "text"},
+		{"неизвестное поле", withLures(`{"id":"x","kind":"robots_txt","trap":"old-admin","html":"<script>"}`), "html"},
+		{"текст у robots", withLures(`{"id":"x","kind":"robots_txt","trap":"old-admin","text":"see {path}"}`), ".text: только"},
+		{"текст у ссылки", withLures(`{"id":"x","kind":"html_link","trap":"old-admin","text":"see {path}"}`), ".text: только"},
+		{"заголовок у комментария", withLures(`{"id":"x","kind":"html_comment","trap":"old-admin","text":"see {path}","header":"X-A"}`),
+			".header: только"},
 		{"слишком много", withLures(strings.TrimSuffix(strings.Repeat(`{},`, maxLures+1), ",")), "не больше 16"},
 
 		// Ссылки в телах ловушек.
@@ -176,5 +180,68 @@ func TestMethodOverride(t *testing.T) {
 	}
 	if Preflighted(req(http.MethodOptions, "X-HTTP-Method-Override", "DELETE")) {
 		t.Error("OPTIONS признан «непростым»")
+	}
+}
+
+// TestHTMLLuresCompile: вставка в <body> собирается при разборе политики;
+// путь в ссылке экранирован для атрибута.
+func TestHTMLLuresCompile(t *testing.T) {
+	t.Parallel()
+
+	withHTML := strings.Replace(lurePolicy, `"lures": [`, `"lures": [
+    {"id": "docs-comment", "kind": "html_comment", "text": "API v2 documentation moved to {path}", "trap": "api-docs"},
+    {"id": "legacy-link", "kind": "html_link", "trap": "legacy-login"},`, 1)
+	withHTML = strings.Replace(withHTML, `"traps": [`, `"traps": [
+    {"id": "legacy-login", "path": "/account/login&legacy", "mode": "enforce", "confidence": "medium",
+     "response": {"status": 401, "content_type": "text/plain", "body": "x"}},`, 1)
+	c, err := Parse([]byte(withHTML))
+	if err != nil {
+		t.Fatalf("политика с HTML-наживками отвергнута: %v", err)
+	}
+	want := `<!-- API v2 documentation moved to /internal/api/v2/docs -->` +
+		`<a href="/account/login&amp;legacy" hidden aria-hidden="true" tabindex="-1" rel="nofollow"></a>`
+	if got := c.HTMLFragment(); got != want {
+		t.Errorf("вставка:\n%s\nожидалось:\n%s", got, want)
+	}
+	if trap, _ := c.Match("/internal/api/v2/docs"); trap.LureID() != "docs-comment" {
+		t.Errorf("к документации ведёт %q", trap.LureID())
+	}
+	if Empty().HTMLFragment() != "" {
+		t.Error("у пустой политики есть HTML-вставка")
+	}
+}
+
+// TestHTMLCommentTextRejects: текст комментария не может закрыть
+// комментарий или открыть новый — ни сам, ни вместе с путём.
+func TestHTMLCommentTextRejects(t *testing.T) {
+	t.Parallel()
+
+	withText := func(text string) string {
+		i := strings.Index(lurePolicy, `"lures"`)
+		return lurePolicy[:i] + `"lures": [{"id":"c","kind":"html_comment","trap":"old-admin","text":"` + text + `"}]}`
+	}
+	tests := []struct{ name, policy, want string }{
+		{"без текста", withText(""), "{path} ровно один раз"},
+		{"без {path}", withText("see docs"), "{path} ровно один раз"},
+		{"{path} дважды", withText("{path} and {path}"), "{path} ровно один раз"},
+		{"закрыть комментарий", withText("x --> <script>alert(1)</script> {path}"), ".text"},
+		{"--!>", withText("x --!> {path}"), ".text"},
+		{"открыть новый", withText("<!-- {path}"), ".text"},
+		{"амперсанд", withText("a &amp; {path}"), ".text"},
+		{"двойной дефис", withText("a -- b {path}"), "двойного дефиса"},
+		{"дефис перед путём", withText("see -{path}"), "вплотную"},
+		{"дефис после пути", withText("{path}- ok"), "вплотную"},
+		{"кириллица", withText("документация: {path}"), ".text"},
+		{"перевод строки", withText(`a\n{path}`), ".text"},
+		{"длинный", withText(strings.Repeat("a", maxLureTextLen) + "{path}"), "не длиннее"},
+		{"путь с --", strings.Replace(withText("see {path}"), "/backup-admin", "/backup--admin", 1), "«--»"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := Parse([]byte(tt.policy)); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("ошибка %v не содержит %q", err, tt.want)
+			}
+		})
 	}
 }
