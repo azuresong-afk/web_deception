@@ -315,6 +315,18 @@ func TestPrepareHTML(t *testing.T) {
 		t.Error("в частичном режиме страница запрошена без сжатия")
 	}
 
+	// POST ответ не правит — исходящий запрос тот же, без нового контекста.
+	h = newHarness(t, htmlPolicy)
+	in, out = req(http.MethodPost, "Sec-Fetch-Dest", "document")
+	if got := h.inj.Prepare(in, out, netip.Addr{}); got != out {
+		t.Error("для POST создан новый запрос")
+	}
+	// isHTMLPage сама не считает страницей ничего, кроме GET и HEAD, —
+	// даже если Prepare когда-нибудь перестанет проверять метод раньше.
+	if isHTMLPage(in) {
+		t.Error("POST назван страницей")
+	}
+
 	// robots.txt при наживках только в HTML — как есть, сжатие не отключается.
 	h = newHarness(t, htmlPolicy)
 	in = httptest.NewRequest(http.MethodGet, "/robots.txt", nil)

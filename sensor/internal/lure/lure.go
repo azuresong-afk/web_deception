@@ -165,8 +165,11 @@ func (inj *Injector) Prepare(in, out *http.Request, client netip.Addr) *http.Req
 		return out
 	}
 	p := inj.cfg.Policy()
-	if len(p.RobotsDisallow()) == 0 && p.HTMLFragment() == "" {
-		// Тела не правятся — ни сжатие, ни клиент не нужны.
+	if len(p.RobotsDisallow()) == 0 && p.HTMLFragment() == "" ||
+		in.Method != http.MethodGet && in.Method != http.MethodHead {
+		// Тела не правятся — ни сжатие, ни клиент не нужны. Правятся
+		// только ответы на GET и HEAD: остальным запросам не нужен и новый
+		// контекст.
 		return out
 	}
 	switch {
