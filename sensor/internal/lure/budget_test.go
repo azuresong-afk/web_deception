@@ -39,7 +39,7 @@ func TestMemoryBudget(t *testing.T) {
 	}
 	_ = h.inj.Modify(resp)
 	// Числится только прочитанное — не резерв на разбор.
-	if held := h.inj.EditMemory(); held < uint64(len(body)) || held >= htmlReserve {
+	if held := h.inj.EditMemory(); held < uint64(len(body)) || held >= uint64(editReserve(int64(len(body)), maxHTMLHead, htmlPerByte)) {
 		t.Errorf("до отправки числится %d байт", held)
 	}
 	_ = resp.Body.Close()
@@ -50,12 +50,12 @@ func TestMemoryBudget(t *testing.T) {
 
 	// Бюджет занят другими ответами: страница и robots.txt — как есть.
 	h = newHarness(t, testPolicy)
-	occupy(h, editMemory-robotsReserve+1)
+	occupy(h, editMemory-editReserve(2, maxRobotsBytes+1, robotsPerByte)+1)
 	if r := run(t, h, app(http.MethodGet, "/robots.txt", 200, http.Header{"Content-Type": {"text/plain"}}, "a\n")); r.body != "a\n" {
 		t.Errorf("robots.txt изменён без бюджета: %q", r.body)
 	}
 	h2 := newHarness(t, htmlPolicy)
-	occupy(h2, editMemory-htmlReserve+1)
+	occupy(h2, editMemory-editReserve(int64(len(body)), maxHTMLHead, htmlPerByte)+1)
 	if r := run(t, h2, page(body)); r.body != body || r.length != int64(len(body)) {
 		t.Errorf("страница изменена без бюджета: %q", r.body)
 	}
@@ -66,7 +66,7 @@ func TestMemoryBudget(t *testing.T) {
 
 	// Ровно на пределе — бюджет ещё выдаётся.
 	h3 := newHarness(t, htmlPolicy)
-	occupy(h3, editMemory-htmlReserve)
+	occupy(h3, editMemory-editReserve(int64(len(body)), maxHTMLHead, htmlPerByte))
 	if r := run(t, h3, page(body)); !strings.Contains(r.body, fragment) {
 		t.Error("на пределе бюджета наживка не поставлена")
 	}
@@ -102,7 +102,7 @@ func TestClientShare(t *testing.T) {
 	// страница другого клиента — с наживкой.
 	h := newHarness(t, htmlPolicy)
 	busy := netip.MustParseAddr("2001:db8::1")
-	hold := h.inj.mem.lease(budgetKey(busy), clientMemory-htmlReserve+1)
+	hold := h.inj.mem.lease(budgetKey(busy), clientMemory-editReserve(int64(len(`<body>x`)), maxHTMLHead, htmlPerByte)+1)
 	defer hold.release()
 	resp := page(`<body>x`)
 	resp.client = busy
@@ -117,9 +117,9 @@ func TestClientShare(t *testing.T) {
 		t.Error("пропуск по доле клиента не учтён")
 	}
 
-	// То же для robots.txt: его резерв — вся доля клиента.
+	// То же для robots.txt.
 	hr := newHarness(t, testPolicy)
-	holdRobots := hr.inj.mem.lease(budgetKey(busy), 1)
+	holdRobots := hr.inj.mem.lease(budgetKey(busy), clientMemory-editReserve(2, maxRobotsBytes+1, robotsPerByte)+1)
 	defer holdRobots.release()
 	robots := app(http.MethodGet, "/robots.txt", 200, http.Header{"Content-Type": {"text/plain"}}, "a\n")
 	robots.client = busy
@@ -153,5 +153,21 @@ func TestBudgetKey(t *testing.T) {
 	}
 	if clientOf(&http.Response{}).IsValid() {
 		t.Error("ответ без запроса получил клиента")
+	}
+}
+
+// TestWorstReserveFitsClientShare: худший резерв правки — тело без длины —
+// помещается в долю клиента. Иначе страницы и robots.txt без
+// Content-Length (chunked) не правились бы никогда, и тихо.
+func TestWorstReserveFitsClientShare(t *testing.T) {
+	t.Parallel()
+
+	for name, r := range map[string]int64{
+		"HTML":       editReserve(-1, maxHTMLHead, htmlPerByte),
+		"robots.txt": editReserve(-1, maxRobotsBytes+1, robotsPerByte),
+	} {
+		if r > clientMemory {
+			t.Errorf("%s: худший резерв %d больше доли клиента %d", name, r, clientMemory)
+		}
 	}
 }

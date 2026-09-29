@@ -35,14 +35,6 @@ import (
 // было 256 КиБ — до 4,5 мс на страницу; найдено замером (ADR-0030).
 const maxHTMLHead = 64 << 10
 
-// htmlReserve — память из бюджета (budget.go) на поиск <body> в худшем
-// случае: буфер прочитанного растёт удвоением, у токенизатора — свой
-// буфер под самый длинный токен и копии атрибутов. Замер —
-// TestEditReserves, около 415 КБ на странице, где весь предел занимает
-// один <script>. Одному клиенту (clientMemory) хватает на восемь
-// разборов одновременно.
-const htmlReserve = 512 << 10
-
 // isHTMLPage — запрос за страницей: GET или HEAD, и браузер сообщил, что ждёт
 // документ (Sec-Fetch-Dest), а без этого заголовка — text/html в Accept.
 // Только для таких запросов сенсор просит у приложения ответ без сжатия:
@@ -115,12 +107,12 @@ func bodyInsertOffset(body io.Reader, consumed *bytes.Buffer) (offset int, err e
 // в e.consumed — чтобы при панике, в том числе внутри токенизатора, ответ
 // можно было собрать обратно.
 func (inj *Injector) injectHTML(resp *http.Response, fragment string, e *edit) {
-	if e.mem = inj.mem.lease(clientOf(resp), htmlReserve); e.mem == nil {
+	if e.mem = inj.mem.lease(clientOf(resp), editReserve(resp.ContentLength, maxHTMLHead, htmlPerByte)); e.mem == nil {
 		inj.Stats.Skipped[SkipMemory].Add(1)
 		return
 	}
 	orig := resp.Body
-	buf := &bytes.Buffer{}
+	buf := newEditBuffer(resp.ContentLength, maxHTMLHead)
 	e.consumed = buf
 	offset, err := bodyInsertOffset(orig, buf)
 	read := buf.Bytes()

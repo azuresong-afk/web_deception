@@ -35,11 +35,6 @@ import (
 // Google читает только первые 500 КиБ; больше — ответ уходит как есть.
 const maxRobotsBytes = 512 << 10
 
-// robotsReserve — память из бюджета (budget.go) на дополнение robots.txt
-// в худшем случае: буфер прочитанного растёт удвоением, новое тело
-// собирается копией. Замер — TestEditReserves, около 3,2 МиБ.
-const robotsReserve = 4 << 20
-
 // robotsPath — путь robots.txt. Роботы запрашивают ровно его.
 const robotsPath = "/robots.txt"
 
@@ -279,7 +274,7 @@ func (inj *Injector) robots(resp *http.Response, paths []string, e *edit) {
 		// «нет файла» и «файл, запрещающий только ловушки» значат почти
 		// одно и то же — ходить можно везде, кроме ловушек.
 		_ = resp.Body.Close()
-		setBody(resp, robotsGroup(paths))
+		setBody(resp, []byte(robotsGroup(paths)))
 		resp.StatusCode = http.StatusOK
 		resp.Status = "200 OK"
 		for _, h := range bodyHeaders {
@@ -321,12 +316,12 @@ func (inj *Injector) robots(resp *http.Response, paths []string, e *edit) {
 		return
 	}
 
-	if e.mem = inj.mem.lease(clientOf(resp), robotsReserve); e.mem == nil {
+	if e.mem = inj.mem.lease(clientOf(resp), editReserve(resp.ContentLength, maxRobotsBytes+1, robotsPerByte)); e.mem == nil {
 		inj.Stats.Skipped[SkipMemory].Add(1)
 		return
 	}
 	orig := resp.Body
-	buf := &bytes.Buffer{}
+	buf := newEditBuffer(resp.ContentLength, maxRobotsBytes+1)
 	e.consumed = buf
 	_, err := buf.ReadFrom(io.LimitReader(orig, maxRobotsBytes+1))
 	data := buf.Bytes()
@@ -343,9 +338,9 @@ func (inj *Injector) robots(resp *http.Response, paths []string, e *edit) {
 		return
 	}
 
-	var b bytes.Buffer
-	b.Grow(len(data) + 64*len(paths))
-	b.Write(data)
+	// Новое тело собирается одним выделением памяти точной длины.
+	body := make([]byte, 0, robotsLength(int64(len(data)), paths))
+	body = append(body, data...)
 	// Своя группа «User-agent: *» в конце: по RFC 9309 группы для одного
 	// робота объединяются, поэтому существующие правила не меняются,
 	// а наши добавляются ко всем роботам. Перед группой — всегда два
@@ -353,13 +348,13 @@ func (inj *Injector) robots(resp *http.Response, paths []string, e *edit) {
 	// пустая строка роботам не мешает, а длина ответа тогда зависит только
 	// от длины файла, и ответ на HEAD её знает (robotsLength).
 	if len(data) > 0 {
-		b.WriteString(robotsSeparator)
+		body = append(body, robotsSeparator...)
 	}
-	b.WriteString(robotsGroup(paths))
+	body = append(body, robotsGroup(paths)...)
 	// Исходное тело прочитано до конца; закрываем его только теперь,
 	// когда новое тело готово.
 	_ = orig.Close()
-	setBody(resp, b.String())
+	setBody(resp, body)
 	// Прочитанное больше не нужно; ждёт отправки только новое тело.
 	e.mem.shrink(resp.ContentLength)
 	resp.Body = heldBody{resp.Body, resp.Body, e.mem}
@@ -405,8 +400,8 @@ func robotsGroup(paths []string) string {
 }
 
 // setBody заменяет тело ответа и его длину.
-func setBody(resp *http.Response, body string) {
-	resp.Body = io.NopCloser(strings.NewReader(body))
+func setBody(resp *http.Response, body []byte) {
+	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
 	// Длина теперь известна: без chunked.
 	resp.TransferEncoding = nil

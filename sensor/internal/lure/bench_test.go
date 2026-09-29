@@ -67,7 +67,7 @@ func BenchmarkBudget(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		client := netip.MustParseAddr("192.0.2.1")
 		for pb.Next() {
-			if l := m.lease(client, htmlReserve); l != nil {
+			if l := m.lease(client, editReserve(9<<10, maxHTMLHead, htmlPerByte)); l != nil {
 				l.shrink(16 << 10)
 				l.release()
 			}

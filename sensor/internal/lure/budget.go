@@ -1,6 +1,7 @@
 package lure
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -38,10 +39,49 @@ const (
 	// Остальное — буферы соединений, события, политика.
 	editMemory = 32 << 20
 	// clientMemory — доля одного клиента: чтобы занять весь бюджет,
-	// нужно не меньше восьми адресов. Не меньше robotsReserve — иначе
-	// robots.txt не дополнялся бы никогда.
+	// нужно не меньше восьми адресов. Не меньше худшего резерва правки —
+	// иначе такие тела не правились бы никогда.
 	clientMemory = editMemory / 8
 )
+
+// Резерв правки считается по длине тела: страница в 9 КиБ не должна
+// занимать бюджет как страница у предела (ADR-0030). Замер —
+// TestEditReserves, все выделения памяти за правку на байт тела:
+//   - HTML — до 6,3: буфер прочитанного, копии атрибутов в токенизаторе;
+//   - robots.txt — до 5 при неизвестной длине (буфер растёт удвоением)
+//     и 2 при известной (буфер сразу нужного размера и новое тело);
+//   - плюс около 5 КиБ на буфер токенизатора.
+//
+// Длина неизвестна (chunked) — резерв как у тела на пределе. Худший резерв
+// обязан помещаться в долю клиента, иначе такие тела не правились бы
+// никогда (TestWorstReserveFitsClientShare).
+const (
+	htmlPerByte   = 8
+	robotsPerByte = 6
+	reserveBase   = 16 << 10
+)
+
+// editReserve — резерв на правку тела длины contentLength, из которого
+// читается не больше limit байт; perByte — байт памяти на байт тела.
+func editReserve(contentLength, limit, perByte int64) int64 {
+	n := limit
+	if contentLength >= 0 && contentLength < limit {
+		n = contentLength
+	}
+	return perByte*n + reserveBase
+}
+
+// newEditBuffer — буфер прочитанного. Если длина тела известна, память
+// выделяется сразу нужного размера: иначе буфер рос бы удвоением
+// и выделил бы вдвое больше. MinRead — запас, который ReadFrom требует
+// для последнего чтения, узнающего о конце тела.
+func newEditBuffer(contentLength, limit int64) *bytes.Buffer {
+	buf := &bytes.Buffer{}
+	if contentLength >= 0 {
+		buf.Grow(int(min(contentLength, limit)) + bytes.MinRead)
+	}
+	return buf
+}
 
 // memBudget — занятая память: всего и по клиентам. Под одной блокировкой:
 // общий предел и доля клиента проверяются и меняются вместе. Блокировка

@@ -192,6 +192,13 @@ func TestRobotsAppend(t *testing.T) {
 	if h.inj.Stats.Robots.Load() != 1 {
 		t.Error("счётчик robots.txt")
 	}
+
+	// Длина неизвестна — дополняется так же: резерв на худший случай
+	// помещается в долю клиента.
+	resp.unknownLength = true
+	if r := run(t, h, resp); r.body != want {
+		t.Errorf("robots.txt без длины: %q", r.body)
+	}
 }
 
 // TestRobotsHead: HEAD /robots.txt отвечает так же, как GET, только без

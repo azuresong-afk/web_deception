@@ -51,6 +51,11 @@ var (
 // latencyBudget — бюджет сенсора: не больше +5 мс к p99 (roadmap, шаг 11).
 const latencyBudget = 5 * time.Millisecond
 
+// minSamples — не меньше стольких запросов на замер. p99 из сотни запросов —
+// это второй по медленности запрос, и один всплеск решал бы исход. Редкие
+// сценарии поэтому идут дольше latency.duration.
+const minSamples = 1000
+
 // scenario — вид запроса. rateDiv делит нагрузку: скачивание 256 КиБ
 // на полной нагрузке мерило бы пропускную способность loopback, а не сенсор.
 type scenario struct {
@@ -75,7 +80,7 @@ var scenarios = []scenario{
 		headers: map[string]string{"Content-Type": "application/json"}, body: `{"data":"` + strings.Repeat("x", 2048) + `"}`,
 		rateDiv: 1, budget: true},
 	{name: "robots.txt", method: http.MethodGet, path: "/robots.txt", rateDiv: 1, budget: true},
-	{name: "скачивание 256 КиБ", method: http.MethodGet, path: "/main.js", rateDiv: 10, budget: true},
+	{name: "скачивание 256 КиБ", method: http.MethodGet, path: "/main.js", rateDiv: 4, budget: true},
 	{name: "касание ловушки", method: http.MethodGet, path: "/.env", rateDiv: 1},
 }
 
@@ -242,12 +247,15 @@ func TestLatencyBudget(t *testing.T) {
 	var report strings.Builder
 	fmt.Fprintf(&report, "\n| Нагрузка | Сценарий | p50 напрямую | p50 сенсор | p99 напрямую | p99 сенсор | +p99 | p99.9 сенсор | ошибки |\n")
 	fmt.Fprintf(&report, "|---|---|---|---|---|---|---|---|---|\n")
-	htmlBefore := metric(t, addrs.Admin.String(), `sensor_lures_total{kind="html"}`)
-	pagesSent := 0
+	admin := addrs.Admin.String()
+	htmlBefore := metric(t, admin, `sensor_lures_total{kind="html"}`)
+	robotsBefore := metric(t, admin, `sensor_lures_total{kind="robots_txt"}`)
+	pagesSent, robotsSent := 0, 0
 
 	for _, rate := range rates {
 		for _, sc := range scenarios {
 			r := max(1, rate/sc.rateDiv)
+			dur := max(*latDuration, time.Duration(float64(minSamples)/float64(r)*float64(time.Second)))
 			rounds := make([][]result, len(targets))
 			for round := range *latRounds {
 				for k := range targets {
@@ -256,11 +264,17 @@ func TestLatencyBudget(t *testing.T) {
 					ti := (k + round) % len(targets)
 					client := newClient()
 					measure(ctx, client, targets[ti].base, sc, r, *latWarmup)
-					res := measure(ctx, client, targets[ti].base, sc, r, *latDuration)
+					res := measure(ctx, client, targets[ti].base, sc, r, dur)
 					client.CloseIdleConnections()
 					rounds[ti] = append(rounds[ti], res)
-					if ti == 1 && sc.path == "/" {
-						pagesSent += int(float64(r) * (latWarmup.Seconds() + latDuration.Seconds()))
+					if ti == 1 {
+						sent := int(float64(r)*latWarmup.Seconds()) + int(float64(r)*dur.Seconds())
+						switch sc.path {
+						case "/":
+							pagesSent += sent
+						case "/robots.txt":
+							robotsSent += sent
+						}
 					}
 				}
 			}
@@ -284,13 +298,18 @@ func TestLatencyBudget(t *testing.T) {
 		}
 	}
 
-	// Наживки под нагрузкой ставились, а не пропускались: каждая страница
-	// через сенсор получила вставку.
-	html := metric(t, addrs.Admin.String(), `sensor_lures_total{kind="html"}`) - htmlBefore
-	skipped := metric(t, addrs.Admin.String(), `sensor_lures_skipped_total{reason="memory"}`)
-	fmt.Fprintf(&report, "\nСтраниц через сенсор: %d, с наживкой: %d, пропущено по памяти: %d\n", pagesSent, html, skipped)
-	if html != pagesSent {
-		t.Errorf("наживка поставлена на %d страниц из %d", html, pagesSent)
+	// Наживки под нагрузкой ставились, а не пропускались: иначе сенсор
+	// укладывался бы в бюджет за счёт того, что перестал работать. Каждая
+	// страница и каждый robots.txt через сенсор получили наживку, пропусков
+	// по памяти нет.
+	html := metric(t, admin, `sensor_lures_total{kind="html"}`) - htmlBefore
+	robots := metric(t, admin, `sensor_lures_total{kind="robots_txt"}`) - robotsBefore
+	skipped := metric(t, admin, `sensor_lures_skipped_total{reason="memory"}`)
+	fmt.Fprintf(&report, "\nЧерез сенсор: страниц %d, с наживкой %d; robots.txt %d, дополнено %d; пропущено по памяти %d\n",
+		pagesSent, html, robotsSent, robots, skipped)
+	if html != pagesSent || robots != robotsSent || skipped != 0 {
+		t.Errorf("под нагрузкой наживки пропускались: страницы %d из %d, robots.txt %d из %d, по памяти %d",
+			html, pagesSent, robots, robotsSent, skipped)
 	}
 	t.Log(report.String())
 
