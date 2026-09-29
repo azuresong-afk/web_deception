@@ -35,12 +35,12 @@ const maxHTMLHead = 256 << 10
 // на странице, где весь предел занимает один <script>.
 const htmlReserve = 2 << 20
 
-// isHTMLPage — запрос за страницей: GET, и браузер сообщил, что ждёт
+// isHTMLPage — запрос за страницей: GET или HEAD, и браузер сообщил, что ждёт
 // документ (Sec-Fetch-Dest), а без этого заголовка — text/html в Accept.
 // Только для таких запросов сенсор просит у приложения ответ без сжатия:
 // картинки, скрипты и API он не трогает.
 func isHTMLPage(r *http.Request) bool {
-	if r.Method != http.MethodGet {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		return false
 	}
 	if dest := r.Header.Get("Sec-Fetch-Dest"); dest != "" {
@@ -51,8 +51,11 @@ func isHTMLPage(r *http.Request) bool {
 
 // htmlEligible — ответ, в который можно вставить наживку, и если нет —
 // почему. ok=false и reason<0 — ответ не страница, считать не нужно.
+// Ответ на HEAD проходит те же проверки: его заголовки должны совпасть
+// с заголовками GET.
 func htmlEligible(resp *http.Response) (ok bool, reason SkipReason) {
-	if resp.Request == nil || resp.Request.Method != http.MethodGet || resp.StatusCode != http.StatusOK {
+	if resp.Request == nil || (resp.Request.Method != http.MethodGet && resp.Request.Method != http.MethodHead) ||
+		resp.StatusCode != http.StatusOK {
 		return false, -1
 	}
 	mediaType, params, _ := strings.Cut(resp.Header.Get("Content-Type"), ";")
@@ -104,7 +107,7 @@ func bodyInsertOffset(body io.Reader, consumed *bytes.Buffer) (offset int, err e
 // в e.consumed — чтобы при панике, в том числе внутри токенизатора, ответ
 // можно было собрать обратно.
 func (inj *Injector) injectHTML(resp *http.Response, fragment string, e *edit) {
-	if e.mem = inj.mem.lease(htmlReserve); e.mem == nil {
+	if e.mem = inj.mem.lease(clientOf(resp), htmlReserve); e.mem == nil {
 		inj.Stats.Skipped[SkipMemory].Add(1)
 		return
 	}
@@ -131,8 +134,18 @@ func (inj *Injector) injectHTML(resp *http.Response, fragment string, e *edit) {
 		bytes.NewReader(read[offset:]), orig), orig, e.mem}
 	e.consumed = nil
 
+	headLikeGet(resp, int64(len(fragment)))
+	inj.Stats.HTML.Add(1)
+}
+
+// headLikeGet правит заголовки страницы, в которую вставлено added байт.
+// Для HEAD — те же заголовки, что получит GET: тела нет, но длина
+// и ETag должны совпасть, иначе сравнение выдало бы сенсор (T5). Страница
+// без <body> на GET останется как есть, а HEAD покажет длину с вставкой —
+// такое расхождение бывает только у страниц, где наживки и так нет.
+func headLikeGet(resp *http.Response, added int64) {
 	if resp.ContentLength >= 0 {
-		resp.ContentLength += int64(len(fragment))
+		resp.ContentLength += added
 		resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	}
 	// Сильный ETag обещает побайтно то же тело, а тело теперь другое.
@@ -145,5 +158,4 @@ func (inj *Injector) injectHTML(resp *http.Response, fragment string, e *edit) {
 	for _, h := range []string{"Content-MD5", "Digest", "Content-Digest", "Repr-Digest"} {
 		resp.Header.Del(h)
 	}
-	inj.Stats.HTML.Add(1)
 }

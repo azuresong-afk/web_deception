@@ -567,6 +567,8 @@ func TestRunHTMLLures(t *testing.T) {
 			_, _ = io.WriteString(w, "\x1f\x8b сжатое")
 			return
 		}
+		// Длина — явно: и на HEAD приложение сообщает длину страницы.
+		w.Header().Set("Content-Length", strconv.Itoa(len(page)))
 		_, _ = io.WriteString(w, page)
 	}))
 	defer app.Close()
@@ -591,9 +593,9 @@ func TestRunHTMLLures(t *testing.T) {
 	addrs, runErr := startSensor(ctx, t, cfg)
 	base := "http://" + addrs.Proxy.String()
 
-	get := func(path string, headers ...string) (http.Header, string) {
+	do := func(method, path string, headers ...string) (http.Header, string) {
 		t.Helper()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+		req, err := http.NewRequestWithContext(ctx, method, base+path, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -607,9 +609,13 @@ func TestRunHTMLLures(t *testing.T) {
 		body, readErr := io.ReadAll(resp.Body)
 		closeErr := resp.Body.Close()
 		if readErr != nil || closeErr != nil {
-			t.Fatalf("GET %s: ответ не прочитан", path)
+			t.Fatalf("%s %s: ответ не прочитан", method, path)
 		}
 		return resp.Header, string(body)
+	}
+	get := func(path string, headers ...string) (http.Header, string) {
+		t.Helper()
+		return do(http.MethodGet, path, headers...)
 	}
 
 	// Браузер открывает страницу: разрешает сжатие, но получает страницу
@@ -625,6 +631,12 @@ func TestRunHTMLLures(t *testing.T) {
 	}
 	if got, _ := lastEncoding.Load().(string); got != "identity" {
 		t.Errorf("приложение получило Accept-Encoding %q", got)
+	}
+
+	// HEAD той же страницы — те же длина и ETag, что у GET (T5).
+	if h, _ := do(http.MethodHead, "/", "Sec-Fetch-Dest", "document", "Accept-Encoding", "gzip, br"); h.Get("Content-Length") != strconv.Itoa(len(want)) ||
+		h.Get("Etag") != `W/"v1"` || h.Get("Content-Encoding") != "" {
+		t.Errorf("HEAD страницы: %v", h)
 	}
 
 	// Запрос из скрипта — как есть: сенсор не отключает ему сжатие.

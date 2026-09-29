@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -65,6 +66,8 @@ type appResponse struct {
 	nilHeader bool
 	// unknownLength — длина тела неизвестна (ContentLength = -1).
 	unknownLength bool
+	// client — адрес клиента, как его передал бы Prepare.
+	client netip.Addr
 }
 
 // app — ответ приложения на запрос method path.
@@ -96,13 +99,17 @@ func run(t *testing.T, h *harness, a appResponse) result {
 	if rc == nil {
 		rc = io.NopCloser(strings.NewReader(a.body))
 	}
+	if a.method == http.MethodHead {
+		// Ответ на HEAD без тела, но с длиной тела, которое получил бы GET.
+		rc = http.NoBody
+	}
 	resp := &http.Response{
 		StatusCode:    a.status,
 		Status:        http.StatusText(a.status),
 		Header:        header,
 		Body:          rc,
 		ContentLength: int64(len(a.body)),
-		Request:       httptest.NewRequest(a.method, a.path, nil),
+		Request:       withClient(httptest.NewRequest(a.method, a.path, nil), a.client),
 	}
 	if a.chunked {
 		resp.TransferEncoding = []string{"chunked"}
@@ -110,7 +117,7 @@ func run(t *testing.T, h *harness, a appResponse) result {
 	if a.unknownLength {
 		resp.ContentLength = -1
 	}
-	memBefore := h.inj.mem.used.Load()
+	memBefore := memUsed(h)
 	if err := h.inj.Modify(resp); err != nil {
 		t.Fatal("Modify вернул ошибку: прокси ответил бы 502")
 	}
@@ -118,7 +125,7 @@ func run(t *testing.T, h *harness, a appResponse) result {
 	_ = resp.Body.Close()
 	// Память правки возвращена, как только прокси закрыл тело, —
 	// после любой правки, пропуска и паники.
-	if used := h.inj.mem.used.Load(); used != memBefore {
+	if used := memUsed(h); used != memBefore {
 		t.Errorf("после Close в бюджете занято %d байт, было %d", used, memBefore)
 	}
 	return result{
@@ -187,6 +194,45 @@ func TestRobotsAppend(t *testing.T) {
 	}
 }
 
+// TestRobotsHead: HEAD /robots.txt отвечает так же, как GET, только без
+// тела: тот же код и та же длина (T5).
+func TestRobotsHead(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, testPolicy)
+	text := http.Header{"Content-Type": {"text/plain"}, "Etag": {`"r"`}}
+	for _, file := range []string{"User-agent: *\nDisallow: /ftp", "User-agent: *\nDisallow: /ftp\n", ""} {
+		get := run(t, h, app(http.MethodGet, "/robots.txt", 200, text.Clone(), file))
+		head := run(t, h, app(http.MethodHead, "/robots.txt", 200, text.Clone(), file))
+		if head.body != "" || head.length != get.length || head.header.Get("Content-Length") != strconv.Itoa(len(get.body)) ||
+			head.header.Get("Etag") != "" {
+			t.Errorf("файл %q: HEAD %d %v, GET %d", file, head.length, head.header, len(get.body))
+		}
+	}
+
+	// У приложения robots.txt нет: HEAD, как и GET, получает 200.
+	get := run(t, h, app(http.MethodGet, "/robots.txt", 404, nil, "nf"))
+	head := run(t, h, app(http.MethodHead, "/robots.txt", 404, nil, "nf"))
+	if head.status != 200 || head.body != "" || head.length != get.length ||
+		head.header.Get("Content-Type") != get.header.Get("Content-Type") {
+		t.Errorf("HEAD при 404: %d, %d, %v", head.status, head.length, head.header)
+	}
+	if h.inj.Stats.Robots.Load() != 4 {
+		t.Errorf("HEAD посчитан как наживка: %d", h.inj.Stats.Robots.Load())
+	}
+
+	// Длина неизвестна или больше предела — HEAD как есть.
+	unknown := app(http.MethodHead, "/robots.txt", 200, text.Clone(), "abc")
+	unknown.unknownLength = true
+	if r := run(t, h, unknown); r.length != -1 || r.header.Get("Content-Length") != "" {
+		t.Errorf("HEAD без длины изменён: %d", r.length)
+	}
+	big := strings.Repeat("a", maxRobotsBytes+1)
+	if r := run(t, h, app(http.MethodHead, "/robots.txt", 200, text.Clone(), big)); r.length != int64(len(big)) {
+		t.Errorf("HEAD большого robots.txt изменён: %d", r.length)
+	}
+}
+
 // TestRobotsCreatedOn404: robots.txt нет — сенсор отвечает своим,
 // заголовки приложения, не описывающие тело, остаются.
 func TestRobotsCreatedOn404(t *testing.T) {
@@ -240,9 +286,10 @@ func TestRobotsLeftAsIs(t *testing.T) {
 		})
 	}
 
-	// Другие пути и методы robots.txt не трогаются вовсе.
+	// Другие пути и методы robots.txt не трогаются вовсе. HEAD — как GET
+	// (TestRobotsHead).
 	for _, req := range []struct{ method, path string }{
-		{http.MethodHead, "/robots.txt"}, {http.MethodGet, "/ROBOTS.TXT"}, {http.MethodGet, "/static/robots.txt"},
+		{http.MethodPost, "/robots.txt"}, {http.MethodGet, "/ROBOTS.TXT"}, {http.MethodGet, "/static/robots.txt"},
 	} {
 		h := newHarness(t, testPolicy)
 		if r := run(t, h, app(req.method, req.path, 404, nil, "nf")); r.status != 404 {
@@ -359,22 +406,34 @@ func TestPrepare(t *testing.T) {
 
 	h := newHarness(t, testPolicy)
 	in, out := conditional("/robots.txt")
-	h.inj.Prepare(in, out)
+	client := netip.MustParseAddr("192.0.2.7")
+	out = h.inj.Prepare(in, out, client)
 	if out.Header.Get("Accept-Encoding") != "identity" || out.Header.Get("If-None-Match") != "" ||
 		out.Header.Get("If-Modified-Since") != "" || out.Header.Get("Range") != "" {
 		t.Errorf("запрос за robots.txt: %v", out.Header)
 	}
+	// Клиент запомнен: правка ответа возьмёт память из его доли.
+	if got := clientOf(&http.Response{Request: out}); got != client {
+		t.Errorf("клиент в исходящем запросе: %v", got)
+	}
+
+	// HEAD — как GET: иначе длины ответов разошлись бы.
+	in, out = conditional("/robots.txt")
+	in.Method = http.MethodHead
+	out = h.inj.Prepare(in, out, client)
+	if out.Header.Get("Accept-Encoding") != "identity" || out.Header.Get("If-None-Match") != "" {
+		t.Errorf("HEAD за robots.txt: %v", out.Header)
+	}
 
 	in, out = conditional("/")
-	h.inj.Prepare(in, out)
+	out = h.inj.Prepare(in, out, client)
 	if out.Header.Get("Accept-Encoding") != "gzip, br" || out.Header.Get("If-None-Match") == "" {
 		t.Errorf("обычный запрос изменён: %v", out.Header)
 	}
 
 	h = newHarness(t, "")
 	in, out = conditional("/robots.txt")
-	h.inj.Prepare(in, out)
-	if out.Header.Get("Accept-Encoding") != "gzip, br" {
+	if got := h.inj.Prepare(in, out, client); got != out || out.Header.Get("Accept-Encoding") != "gzip, br" {
 		t.Error("запрос изменён без наживок в robots.txt")
 	}
 }
@@ -396,6 +455,11 @@ func FuzzRobotsAppend(f *testing.F) {
 		}
 		if r.length != int64(len(r.body)) {
 			t.Errorf("длина %d, тело %d", r.length, len(r.body))
+		}
+		// Ответ на HEAD знает ту же длину, не видя файла.
+		head := run(t, h, app(http.MethodHead, "/robots.txt", 200, http.Header{"Content-Type": {"text/plain"}}, original))
+		if head.length != r.length || head.header.Get("Content-Length") != strconv.FormatInt(r.length, 10) {
+			t.Errorf("HEAD: длина %d, у GET %d", head.length, r.length)
 		}
 	})
 }

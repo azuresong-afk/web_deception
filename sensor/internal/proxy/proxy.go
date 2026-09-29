@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"sync"
 	"sync/atomic"
@@ -94,8 +95,9 @@ type Options struct {
 // сбоя наживки: ошибка из ModifyResponse — это 502 для клиента.
 type Lures interface {
 	// Prepare правит исходящий запрос: in — запрос клиента, out — копия,
-	// которая уйдёт приложению.
-	Prepare(in, out *http.Request)
+	// которая уйдёт приложению, client — адрес клиента (forwarded.Client.Addr).
+	// Возвращает запрос, который прокси отправит вместо out.
+	Prepare(in, out *http.Request, client netip.Addr) *http.Request
 	// Modify правит ответ приложения до того, как он уйдёт клиенту.
 	Modify(resp *http.Response) error
 }
@@ -205,7 +207,9 @@ func newHandler(upstream *url.URL, o Options, transport http.RoundTripper, idle 
 			}
 			forwarded.SetOutbound(pr.Out.Header, pr.In, client)
 			if o.Lures != nil {
-				o.Lures.Prepare(pr.In, pr.Out)
+				// ReverseProxy отправляет pr.Out, прочитав его после Rewrite:
+				// замена запроса здесь — штатный способ передать контекст.
+				pr.Out = o.Lures.Prepare(pr.In, pr.Out, client.Addr)
 			}
 		},
 		Transport:    transport,

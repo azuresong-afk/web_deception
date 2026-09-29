@@ -798,3 +798,38 @@ func TestBufferPool(t *testing.T) {
 		t.Errorf("из пула выдан буфер размером %d", got)
 	}
 }
+
+// ctxLures — наживки-заглушка: Prepare кладёт адрес клиента в контекст
+// исходящего запроса, Modify проверяет, что ответ ссылается на этот запрос.
+type ctxLures struct{ seen chan netip.Addr }
+
+type ctxLuresKey struct{}
+
+func (l ctxLures) Prepare(_, out *http.Request, client netip.Addr) *http.Request {
+	return out.WithContext(context.WithValue(out.Context(), ctxLuresKey{}, client))
+}
+
+func (l ctxLures) Modify(resp *http.Response) error {
+	a, _ := resp.Request.Context().Value(ctxLuresKey{}).(netip.Addr)
+	l.seen <- a
+	return nil
+}
+
+// TestLuresSeeClient: прокси отправляет запрос, который вернул Prepare, —
+// и правка ответа знает клиента (доля бюджета памяти, ADR-0029).
+func TestLuresSeeClient(t *testing.T) {
+	t.Parallel()
+
+	app := newFakeApp(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
+	opts := testOptions(noTrust, discardLogger())
+	lures := ctxLures{seen: make(chan netip.Addr, 1)}
+	opts.Lures = lures
+	addr := startProxy(t, NewHandler(mustURL(t, app.URL), opts), nil)
+
+	if code, _ := rawRequest(t, addr, "GET / HTTP/1.1\r\nHost: x\r\n\r\n"); code != http.StatusOK {
+		t.Fatalf("код %d", code)
+	}
+	if got := <-lures.seen; got != netip.MustParseAddr("127.0.0.1") {
+		t.Errorf("правка ответа видит клиента %v", got)
+	}
+}

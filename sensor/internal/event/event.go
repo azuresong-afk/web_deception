@@ -134,10 +134,11 @@ type Request struct {
 	Fetch *Fetch `json:"sec_fetch,omitempty"`
 }
 
-// Fetch — заголовки Fetch Metadata (Sec-Fetch-*). Их ставит сам браузер,
-// и скрипт на странице изменить их не может. По ним видно, не пришёл ли
-// запрос с чужого сайта — не заставила ли чужая страница браузер
-// пользователя коснуться ловушки (угроза T2, ADR-0026).
+// Fetch — заголовки Fetch Metadata (Sec-Fetch-*) и Sec-Purpose. Их ставит
+// сам браузер, и скрипт на странице изменить их не может. По ним видно,
+// не пришёл ли запрос с чужого сайта — не заставила ли чужая страница
+// браузер пользователя коснуться ловушки (угроза T2, ADR-0026), и не
+// предзагрузка ли это.
 //
 // Инструмент атакующего может прислать любые значения. Поэтому это
 // свидетельство о браузере, а не доказательство: «cross-site» от curl
@@ -157,6 +158,11 @@ type Fetch struct {
 	Dest string `json:"dest,omitempty"`
 	// User — переход вызван действием пользователя (клик), а не скриптом.
 	User bool `json:"user,omitempty"`
+	// Purpose — заголовок Sec-Purpose: браузер запросил адрес заранее,
+	// а не по действию человека (prefetch — предзагрузка, prefetch;prerender —
+	// предварительная отрисовка). Касание ловушки таким запросом — шум:
+	// браузер посетителя сам прошёл по ссылке на странице (ADR-0029).
+	Purpose string `json:"purpose,omitempty"`
 }
 
 // fetchOther — значение Sec-Fetch-*, которого нет в спецификации.
@@ -167,6 +173,11 @@ var (
 	fetchSites = map[string]bool{"cross-site": true, "same-origin": true, "same-site": true, "none": true}
 	fetchModes = map[string]bool{
 		"cors": true, "navigate": true, "no-cors": true, "same-origin": true, "websocket": true,
+	}
+	// Значения Sec-Purpose, которые ставят браузеры: Chrome — все три,
+	// Firefox — prefetch.
+	fetchPurposes = map[string]bool{
+		"prefetch": true, "prefetch;prerender": true, "prefetch;anonymous-client-ip": true,
 	}
 	fetchDests = map[string]bool{
 		"audio": true, "audioworklet": true, "document": true, "embed": true, "empty": true,
@@ -208,7 +219,8 @@ func ClientFrom(c forwarded.Client) *Client {
 // RequestFrom извлекает из запроса метаданные для события.
 //
 // Функция читает ровно это: метод, путь, User-Agent, факт наличия
-// параметров и заголовки Sec-Fetch-* (только значения из спецификации).
+// параметров и заголовки Sec-Fetch-* и Sec-Purpose (только значения
+// из спецификации).
 // Всё остальное из запроса в событие не попадает.
 func RequestFrom(r *http.Request) *Request {
 	method, _ := Clean(r.Method, maxMethodBytes)
@@ -231,7 +243,8 @@ func fetchFrom(h http.Header) *Fetch {
 		Mode: fetchValue(h.Get("Sec-Fetch-Mode"), fetchModes),
 		Dest: fetchValue(h.Get("Sec-Fetch-Dest"), fetchDests),
 		// Браузер присылает только «?1»; «?0» он не отправляет вовсе.
-		User: h.Get("Sec-Fetch-User") == "?1",
+		User:    h.Get("Sec-Fetch-User") == "?1",
+		Purpose: fetchValue(h.Get("Sec-Purpose"), fetchPurposes),
 	}
 	if f == (Fetch{}) {
 		return nil

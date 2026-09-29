@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -142,7 +143,13 @@ func New(cfg Config) *Injector {
 }
 
 // Prepare правит запрос, который сенсор отправит приложению, если ответ
-// на него получит наживку. in — запрос клиента, out — исходящий.
+// на него получит наживку. in — запрос клиента, out — исходящий, client —
+// адрес клиента после разбора доверенных прокси. Возвращает исходящий
+// запрос, который отправит прокси: в нём запомнен клиент, чтобы правка
+// ответа взяла память из его доли бюджета (budget.go).
+//
+// HEAD правится так же, как GET: иначе по ответам на HEAD и GET одного
+// адреса атакующий отличил бы сенсор (T5, ADR-0029).
 //
 // Для robots.txt сенсор просит ответ без сжатия и без условий: сжатый
 // robots.txt не дополнить, а на условный запрос приложение ответило бы 304,
@@ -153,15 +160,22 @@ func New(cfg Config) *Injector {
 // библиотеке Go не распаковать, а вставить наживку в сжатую страницу нельзя.
 // Условия здесь остаются: на 304 браузер покажет страницу из своего кэша,
 // а её он получил от сенсора — с наживкой (ADR-0028).
-func (inj *Injector) Prepare(in, out *http.Request) {
+func (inj *Injector) Prepare(in, out *http.Request, client netip.Addr) *http.Request {
 	if inj.cfg.Degraded() {
-		return
+		return out
 	}
 	p := inj.cfg.Policy()
+	if len(p.RobotsDisallow()) == 0 && p.HTMLFragment() == "" ||
+		in.Method != http.MethodGet && in.Method != http.MethodHead {
+		// Тела не правятся — ни сжатие, ни клиент не нужны. Правятся
+		// только ответы на GET и HEAD: остальным запросам не нужен и новый
+		// контекст.
+		return out
+	}
 	switch {
 	case isRobots(in):
 		if len(p.RobotsDisallow()) == 0 {
-			return
+			break
 		}
 		out.Header.Set("Accept-Encoding", "identity")
 		for _, h := range []string{"If-None-Match", "If-Modified-Since", "If-Match", "If-Unmodified-Since", "If-Range", "Range"} {
@@ -170,6 +184,7 @@ func (inj *Injector) Prepare(in, out *http.Request) {
 	case p.HTMLFragment() != "" && isHTMLPage(in):
 		out.Header.Set("Accept-Encoding", "identity")
 	}
+	return withClient(out, client)
 }
 
 // Modify ставит наживки в ответ приложения. Ошибку не возвращает никогда:
@@ -214,9 +229,12 @@ func (inj *Injector) Modify(resp *http.Response) error {
 			inj.robots(resp, p.RobotsDisallow(), &e)
 		}
 	case p.HTMLFragment() != "":
-		if ok, reason := htmlEligible(resp); ok {
+		switch ok, reason := htmlEligible(resp); {
+		case ok && resp.Request.Method == http.MethodHead:
+			headLikeGet(resp, int64(len(p.HTMLFragment())))
+		case ok:
 			inj.injectHTML(resp, p.HTMLFragment(), &e)
-		} else if reason >= 0 {
+		case reason >= 0:
 			inj.Stats.Skipped[reason].Add(1)
 		}
 	}
@@ -269,6 +287,11 @@ func (inj *Injector) robots(resp *http.Response, paths []string, e *edit) {
 		}
 		resp.Header.Set("Content-Type", "text/plain; charset=utf-8")
 		resp.Header.Set("Content-Length", strconv.Itoa(int(resp.ContentLength)))
+		if resp.Request.Method == http.MethodHead {
+			// Те же заголовки и длина, что у GET, но без тела.
+			resp.Body = http.NoBody
+			return
+		}
 		inj.Stats.Robots.Add(1)
 		return
 	default:
@@ -285,8 +308,20 @@ func (inj *Injector) robots(resp *http.Response, paths []string, e *edit) {
 		inj.Stats.Skipped[SkipRobotsEncoded].Add(1)
 		return
 	}
+	if resp.Request.Method == http.MethodHead {
+		// Тела нет, но длина та же, что получит GET: она зависит только
+		// от длины файла приложения (robotsLength).
+		if resp.ContentLength >= 0 && resp.ContentLength <= maxRobotsBytes {
+			resp.ContentLength = robotsLength(resp.ContentLength, paths)
+			resp.Header.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
+			for _, h := range []string{"ETag", "Content-MD5", "Digest", "Content-Digest", "Repr-Digest"} {
+				resp.Header.Del(h)
+			}
+		}
+		return
+	}
 
-	if e.mem = inj.mem.lease(robotsReserve); e.mem == nil {
+	if e.mem = inj.mem.lease(clientOf(resp), robotsReserve); e.mem == nil {
 		inj.Stats.Skipped[SkipMemory].Add(1)
 		return
 	}
@@ -311,13 +346,15 @@ func (inj *Injector) robots(resp *http.Response, paths []string, e *edit) {
 	var b bytes.Buffer
 	b.Grow(len(data) + 64*len(paths))
 	b.Write(data)
-	if len(data) > 0 && data[len(data)-1] != '\n' {
-		b.WriteByte('\n')
-	}
 	// Своя группа «User-agent: *» в конце: по RFC 9309 группы для одного
 	// робота объединяются, поэтому существующие правила не меняются,
-	// а наши добавляются ко всем роботам.
-	b.WriteByte('\n')
+	// а наши добавляются ко всем роботам. Перед группой — всегда два
+	// перевода строки, даже если файл уже кончается переводом: лишняя
+	// пустая строка роботам не мешает, а длина ответа тогда зависит только
+	// от длины файла, и ответ на HEAD её знает (robotsLength).
+	if len(data) > 0 {
+		b.WriteString(robotsSeparator)
+	}
 	b.WriteString(robotsGroup(paths))
 	// Исходное тело прочитано до конца; закрываем его только теперь,
 	// когда новое тело готово.
@@ -343,6 +380,18 @@ var bodyHeaders = []string{
 	"Content-MD5", "Digest", "Content-Digest", "Repr-Digest",
 }
 
+// robotsSeparator — между файлом приложения и группой сенсора.
+const robotsSeparator = "\n\n"
+
+// robotsLength — длина дополненного robots.txt по длине файла приложения.
+func robotsLength(appLength int64, paths []string) int64 {
+	n := appLength + int64(len(robotsGroup(paths)))
+	if appLength > 0 {
+		n += int64(len(robotsSeparator))
+	}
+	return n
+}
+
 // robotsGroup — группа robots.txt со строками-наживками.
 func robotsGroup(paths []string) string {
 	var b strings.Builder
@@ -363,9 +412,9 @@ func setBody(resp *http.Response, body string) {
 	resp.TransferEncoding = nil
 }
 
-// isRobots — запрос за robots.txt.
+// isRobots — запрос за robots.txt: GET или HEAD.
 func isRobots(r *http.Request) bool {
-	return r.Method == http.MethodGet && r.URL != nil && r.URL.Path == robotsPath
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && r.URL != nil && r.URL.Path == robotsPath
 }
 
 // readCloser — Reader с Close исходного тела: соединение с приложением
