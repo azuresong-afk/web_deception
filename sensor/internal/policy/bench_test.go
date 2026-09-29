@@ -4,6 +4,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,8 +29,13 @@ func demoPolicy(b *testing.B) *Compiled {
 // попадание и путь, который нужно нормализовать.
 func BenchmarkMatch(b *testing.B) {
 	c := demoPolicy(b)
-	for _, path := range []string{"/api/Products/42", "/.env", "//./api/../.env", "/" + string(make([]byte, 200))} {
-		b.Run(path[:min(len(path), 20)], func(b *testing.B) {
+	for name, path := range map[string]string{
+		"промах":       "/api/Products/42",
+		"попадание":    "/.env",
+		"нормализация": "//./api/../.env",
+		"длинный путь": "/" + strings.Repeat("a", 200),
+	} {
+		b.Run(name, func(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				c.Match(path)

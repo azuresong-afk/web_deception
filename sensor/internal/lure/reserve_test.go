@@ -3,6 +3,7 @@
 package lure
 
 import (
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -69,9 +70,16 @@ func TestEditReserves(t *testing.T) {
 						sh.name, len(body), !unknown, alloc, reserve)
 				}
 				// До отправки за ответом числится только то, что ждёт
-				// клиента, — меньше резерва на разбор.
-				if held := h.inj.EditMemory(); held > uint64(reserve/2) {
+				// клиента, — меньше резерва на разбор. При известной длине
+				// буфер выделен сразу нужного размера: прочитанное плюс
+				// запас ReadFrom и округление крупного выделения до страниц
+				// по 8 КиБ, а не вдвое больше, как при росте удвоением.
+				held := h.inj.EditMemory()
+				if held > uint64(reserve/2) {
 					t.Errorf("%s, %d байт: за ответом числится %d байт", sh.name, len(body), held)
+				}
+				if read := min(int64(len(body)), sh.limit); !unknown && held > uint64(read+bytes.MinRead+8<<10) {
+					t.Errorf("%s, %d байт: при известной длине числится %d байт — буфер рос удвоением?", sh.name, len(body), held)
 				}
 				_ = resp.Body.Close()
 				if memUsed(h) != 0 {

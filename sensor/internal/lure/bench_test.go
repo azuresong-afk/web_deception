@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -85,7 +86,7 @@ func BenchmarkGzipPage(b *testing.B) {
 			w, _ := gzip.NewWriterLevel(io.Discard, level)
 			return w
 		}}
-		b.Run("новый writer, уровень "+string(rune('0'+level)), func(b *testing.B) {
+		b.Run("новый writer, уровень "+strconv.Itoa(level), func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(page)))
 			var out bytes.Buffer
@@ -96,7 +97,7 @@ func BenchmarkGzipPage(b *testing.B) {
 				_ = w.Close()
 			}
 		})
-		b.Run("writer из пула, уровень "+string(rune('0'+level)), func(b *testing.B) {
+		b.Run("writer из пула, уровень "+strconv.Itoa(level), func(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(len(page)))
 			var out bytes.Buffer

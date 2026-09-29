@@ -171,3 +171,24 @@ func TestWorstReserveFitsClientShare(t *testing.T) {
 		}
 	}
 }
+
+// TestEditReserve: резерв считается по длине тела, а без длины или сверх
+// предела — как для тела на пределе. Ожидаемые числа записаны явно,
+// а не через саму функцию: иначе тест не заметил бы ошибку в формуле.
+func TestEditReserve(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		length, limit, perByte, want int64
+	}{
+		{9000, 64 << 10, 8, 8*9000 + 16<<10},
+		{0, 64 << 10, 8, 16 << 10},
+		{-1, 64 << 10, 8, 8*(64<<10) + 16<<10},
+		{1 << 20, 64 << 10, 8, 8*(64<<10) + 16<<10},
+		{30, 512<<10 + 1, 6, 6*30 + 16<<10},
+	} {
+		if got := editReserve(tc.length, tc.limit, tc.perByte); got != tc.want {
+			t.Errorf("editReserve(%d, %d, %d) = %d, ожидалось %d", tc.length, tc.limit, tc.perByte, got, tc.want)
+		}
+	}
+}
