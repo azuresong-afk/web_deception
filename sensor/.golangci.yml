@@ -7,6 +7,11 @@ version: "2"
 
 run:
   timeout: 5m
+  # Замер задержки (cmd/sensor/latency_test.go) собирается только с тегом
+  # latency, чтобы не идти в make test. Без тега здесь линтер его бы
+  # не видел вовсе — код без проверки (ADR-0030).
+  build-tags:
+    - latency
 
 linters:
   # Стандартный набор: errcheck (проигнорированные ошибки), govet

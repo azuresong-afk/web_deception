@@ -58,7 +58,7 @@ VERSION_PKG := github.com/azuresong-afk/web_deception/sensor/internal/version
 .PHONY: help deps fmt fmt-go fmt-py lint lint-go lint-py lint-containers lint-workflows \
         security security-secrets security-go security-py security-sast \
         security-containers security-dockerfiles security-images \
-        test test-go test-py test-scripts test-hooks hooks \
+        test test-go test-py test-scripts test-hooks hooks bench \
         build run-sensor run-cp clean secrets images check-images smoke smoke-events dev dev-demo dev-vulnbank dev-events policy-reload \
         dev-ps dev-logs dev-down dev-reset vulnbank-requirements
 
@@ -144,6 +144,19 @@ test-py:
 test-scripts:
 	@echo "==> scripts: unittest"
 	@$(UV) run --project $(CP_DIR) python -m unittest discover -s scripts
+
+# Замер производительности сенсора (ADR-0030): микробенчмарки горячего
+# пути и задержка под нагрузкой — напрямую в приложение и через сенсор.
+# Не входит в make test и CI: идёт минуты, а результат зависит от машины
+# и соседей по ней. Бюджет сенсора — +5 мс к p99; превышение — ошибка.
+# Нагрузку и длительность можно задать: make bench BENCH_ARGS="-latency.rates=500 -latency.rounds=5"
+BENCH_ARGS ?=
+
+bench: ## Замерить производительность сенсора: микробенчмарки и задержку под нагрузкой
+	@echo "==> sensor: микробенчмарки"
+	@cd $(SENSOR_DIR) && $(GO) test -run '^$$' -bench . -benchmem -benchtime 1s ./...
+	@echo "==> sensor: задержка под нагрузкой (несколько минут)"
+	@cd $(SENSOR_DIR) && $(GO) test -tags latency -count=1 -timeout 30m -run '^TestLatencyBudget$$' -v ./cmd/sensor/ -args $(BENCH_ARGS)
 
 # Хуки проверяются по-настоящему: во временном репозитории делаются коммиты
 # с секретом, с неотформатированным кодом и с плохим сообщением. Нужен Go
