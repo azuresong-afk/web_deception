@@ -73,11 +73,11 @@ func TestEditReserves(t *testing.T) {
 				tt.name, !tt.unknownLength, alloc, tt.reserve)
 		}
 		// До отправки за ответом числится только то, что ждёт клиента.
-		if held := h.inj.mem.used.Load(); held <= 0 || held > tt.reserve/2 {
+		if held := h.inj.EditMemory(); held == 0 || held > uint64(tt.reserve/2) {
 			t.Errorf("%s: за ответом числится %d байт", tt.name, held)
 		}
 		_ = resp.Body.Close()
-		if h.inj.mem.used.Load() != 0 {
+		if memUsed(h) != 0 {
 			t.Errorf("%s: память не возвращена", tt.name)
 		}
 	}

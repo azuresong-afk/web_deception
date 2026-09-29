@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"strings"
 	"testing"
@@ -114,7 +115,7 @@ func TestHTMLEligible(t *testing.T) {
 	}{
 		{"404", app(http.MethodGet, "/", 404, http.Header{"Content-Type": {"text/html"}}, body), -1},
 		{"POST", app(http.MethodPost, "/", 200, http.Header{"Content-Type": {"text/html"}}, body), -1},
-		{"HEAD", app(http.MethodHead, "/", 200, http.Header{"Content-Type": {"text/html"}}, body), -1},
+		{"PUT", app(http.MethodPut, "/", 200, http.Header{"Content-Type": {"text/html"}}, body), -1},
 		{"JSON", app(http.MethodGet, "/", 200, http.Header{"Content-Type": {"application/json"}}, body), -1},
 		{"XHTML", app(http.MethodGet, "/", 200, http.Header{"Content-Type": {"application/xhtml+xml"}}, body), -1},
 		{"без типа", app(http.MethodGet, "/", 200, nil, body), -1},
@@ -226,6 +227,35 @@ func TestInjectHTMLPanic(t *testing.T) {
 	}
 }
 
+// TestHeadLikeGet: ответ на HEAD страницы получает те же длину и ETag,
+// что GET: иначе сравнение ответов выдало бы сенсор (T5).
+func TestHeadLikeGet(t *testing.T) {
+	t.Parallel()
+
+	const body = `<html><body class="x">text`
+	hdr := func() http.Header {
+		return http.Header{"Content-Type": {"text/html"}, "Etag": {`"v1"`}, "Content-Md5": {"x"}}
+	}
+	h := newHarness(t, htmlPolicy)
+	get := run(t, h, app(http.MethodGet, "/", 200, hdr(), body))
+	head := run(t, h, app(http.MethodHead, "/", 200, hdr(), body))
+	if head.body != "" || head.length != get.length ||
+		head.header.Get("Content-Length") != get.header.Get("Content-Length") ||
+		head.header.Get("Etag") != get.header.Get("Etag") || head.header.Get("Content-Md5") != "" {
+		t.Errorf("HEAD %d %v, GET %d %v", head.length, head.header, get.length, get.header)
+	}
+	if h.inj.Stats.HTML.Load() != 1 {
+		t.Error("HEAD посчитан как страница с наживкой")
+	}
+
+	// Сжатый ответ на HEAD — как есть, как и на GET.
+	enc := hdr()
+	enc.Set("Content-Encoding", "br")
+	if r := run(t, h, app(http.MethodHead, "/", 200, enc, body)); r.length != int64(len(body)) || r.header.Get("Etag") != `"v1"` {
+		t.Errorf("сжатый HEAD изменён: %d %v", r.length, r.header)
+	}
+}
+
 // TestPrepareHTML: без сжатия сенсор просит только страницы.
 func TestPrepareHTML(t *testing.T) {
 	t.Parallel()
@@ -253,11 +283,12 @@ func TestPrepareHTML(t *testing.T) {
 		{"картинка", http.MethodGet, []string{"Sec-Fetch-Dest", "image"}, false},
 		{"curl", http.MethodGet, []string{"Accept", "*/*"}, false},
 		{"POST формы", http.MethodPost, []string{"Sec-Fetch-Dest", "document"}, false},
+		{"HEAD страницы — как GET", http.MethodHead, []string{"Sec-Fetch-Dest", "document"}, true},
 	}
 	for _, tt := range tests {
 		h := newHarness(t, htmlPolicy)
 		in, out := req(tt.method, tt.headers...)
-		h.inj.Prepare(in, out)
+		out = h.inj.Prepare(in, out, netip.Addr{})
 		if got := out.Header.Get("Accept-Encoding") == "identity"; got != tt.identity {
 			t.Errorf("%s: identity = %v", tt.name, got)
 		}
@@ -270,7 +301,7 @@ func TestPrepareHTML(t *testing.T) {
 
 	h := newHarness(t, testPolicy) // наживки только в заголовке и robots.txt
 	in, out := req(http.MethodGet, "Sec-Fetch-Dest", "document")
-	h.inj.Prepare(in, out)
+	out = h.inj.Prepare(in, out, netip.Addr{})
 	if out.Header.Get("Accept-Encoding") != "gzip, br" {
 		t.Error("без HTML-наживок страница запрошена без сжатия")
 	}
@@ -279,9 +310,18 @@ func TestPrepareHTML(t *testing.T) {
 	h = newHarness(t, htmlPolicy)
 	h.degraded.Store(true)
 	in, out = req(http.MethodGet, "Sec-Fetch-Dest", "document")
-	h.inj.Prepare(in, out)
+	out = h.inj.Prepare(in, out, netip.Addr{})
 	if out.Header.Get("Accept-Encoding") != "gzip, br" {
 		t.Error("в частичном режиме страница запрошена без сжатия")
+	}
+
+	// robots.txt при наживках только в HTML — как есть, сжатие не отключается.
+	h = newHarness(t, htmlPolicy)
+	in = httptest.NewRequest(http.MethodGet, "/robots.txt", nil)
+	out = in.Clone(in.Context())
+	out.Header.Set("Accept-Encoding", "gzip, br")
+	if out = h.inj.Prepare(in, out, netip.Addr{}); out.Header.Get("Accept-Encoding") != "gzip, br" {
+		t.Error("robots.txt без наживок в нём запрошен без сжатия")
 	}
 }
 

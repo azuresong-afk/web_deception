@@ -131,6 +131,13 @@ func TestRequestFromFetch(t *testing.T) {
 			"Sec-Fetch-Site": "Cross-Site", "Sec-Fetch-Mode": "<script>", "Sec-Fetch-Dest": "evil\nline",
 		}, &Fetch{Site: "other", Mode: "other", Dest: "other"}},
 		{"Sec-Fetch-User не ?1", map[string]string{"Sec-Fetch-User": "?0"}, nil},
+		{"предзагрузка", map[string]string{
+			"Sec-Purpose": "prefetch", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+		}, &Fetch{Mode: "navigate", Dest: "document", Purpose: "prefetch"}},
+		{"предварительная отрисовка", map[string]string{"Sec-Purpose": "prefetch;prerender"},
+			&Fetch{Purpose: "prefetch;prerender"}},
+		{"Sec-Purpose не из списка", map[string]string{"Sec-Purpose": "prefetch; evil=\"<x>\""},
+			&Fetch{Purpose: "other"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
