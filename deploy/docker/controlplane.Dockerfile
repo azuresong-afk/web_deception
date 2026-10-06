@@ -53,7 +53,7 @@ RUN python -m compileall -q ./src
 # Тег nonroot — вариант образа, где пользователь по умолчанию 65532, а не root.
 # Мы всё равно задаём USER явно ниже: проверка политики контейнеров (D3)
 # требует числовой UID в самом Dockerfile, а не в чужом образе.
-FROM gcr.io/distroless/python3-debian13:nonroot@sha256:8ee214843129f43e2ebf5e0ca9f2e4e6d8292143d1b8a6787f169b5898578884
+FROM gcr.io/distroless/python3-debian13:nonroot@sha256:774595d652a294b54c9bd575b2d9fdd1a4b47547dc17b8bfa4c0e953c64855b3
 
 # Файлы приложения принадлежат root и доступны только для чтения. Процесс
 # приложения работает от непривилегированного пользователя и не может изменить
