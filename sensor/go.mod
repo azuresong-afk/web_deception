@@ -12,4 +12,4 @@ module github.com/azuresong-afk/web_deception/sensor
 // закреплённый по digest в deploy/docker/sensor.Dockerfile.
 go 1.27.0
 
-require golang.org/x/net v0.59.0
+require golang.org/x/net v0.61.0
