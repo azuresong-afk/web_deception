@@ -18,14 +18,14 @@
 # значило бы исполнять чужой код сборки.
 
 # ---------------------------------------------------------------- сборка ---
-FROM python:3.12-slim-trixie@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9 AS build
+FROM python:3.12-slim-trixie@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1 AS build
 
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --require-hashes --only-binary=:all: \
         --target /deps -r /tmp/requirements.txt
 
 # -------------------------------------------------------------- рантайм ---
-FROM python:3.12-slim-trixie@sha256:2f17fc044b579bab302c2e8054d3a686e2cb9a83de48e70534b94cd8ebbe06a9
+FROM python:3.12-slim-trixie@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
 
 # Пользователь с записью в /etc/passwd: отладчик Werkzeug при старте ищет
 # имя пользователя по UID. pip удаляется: зависимости уже установлены,
