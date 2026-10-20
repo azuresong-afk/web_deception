@@ -36,7 +36,7 @@ services:
   # CodeQL, gosec и ruff; Semgrep — только наши правила.
   semgrep:
     <<: *scanner
-    image: semgrep/semgrep:1.177.0@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
+    image: semgrep/semgrep:1.180.0@sha256:529ee8a277ec8adc5b534d7c74eea0a47e9de21d62852b6ba7ac6ba9566845c3
     network_mode: none
     volumes: ["../..:/src:ro"]
     entrypoint: ["semgrep"]
