@@ -194,7 +194,7 @@ services:
   # сенсора на этапе 2. Запускается только в профиле demo: make dev-demo.
   juice-shop:
     <<: *hardening
-    image: bkimminich/juice-shop:v20.2.0@sha256:8739101ade29358abb5469ee66ae78e582c97ed0a5543a4ad102e5fa5193526b
+    image: bkimminich/juice-shop:v20.3.0@sha256:cea5a4af4aacee498c491491af0408934ec81d004035c0a02ef3e54395e3bf27
     profiles: [demo]
     user: "65532:65532"
     # Файловая система НЕ только для чтения: приложение пишет свою базу и логи.
