@@ -141,7 +141,7 @@ services:
 
   postgres:
     <<: *hardening
-    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     # Образ по умолчанию стартует от root и понижает права сам. Мы запускаем
     # сразу от пользователя postgres (UID 70 в alpine-образе): процессу,
     # который никогда не был root, нечего «понижать».
@@ -260,7 +260,7 @@ services:
   # запуске приложение начинает с чистого листа.
   vulnbank-db:
     <<: *hardening
-    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    image: postgres:18-alpine@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     profiles: [demo-vulnbank]
     user: "70:70"
     read_only: true
